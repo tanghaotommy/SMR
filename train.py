@@ -15,6 +15,7 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
+import torchvision
 from torchvision.transforms.functional import to_pil_image
 import torchvision.utils as vutils
 import torch.nn.functional as F
@@ -30,7 +31,8 @@ from kaolin.render.mesh import dibr_rasterization, texture_mapping, \
 
 # import from folder
 from fid_score import calculate_fid_given_paths
-from datasets.bird import Dataset
+from datasets.bird import Dataset as BirdDataset
+from datasets.co3d import Co3DDataset
 from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder
 
@@ -38,6 +40,7 @@ torch.autograd.set_detect_anomaly(True)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--outf', help='folder to output images and model checkpoints')
+parser.add_argument('--dataset', help='dataset name', default='bird')
 parser.add_argument('--dataroot', help='path to dataset root dir')
 parser.add_argument('--template_path', default='template/sphere.obj', help='template mesh path')
 parser.add_argument('--category', type=str, default='bird', help='list of object classes to use')
@@ -62,6 +65,7 @@ parser.add_argument('--lambda_lc', type=float, default=0.001, help='parameter')
 parser.add_argument('--azi_scope', type=float, default=360, help='parameter')
 parser.add_argument('--elev_range', type=str, default="0~30", help='~ separated list of classes for the lsun data set')
 parser.add_argument('--dist_range', type=str, default="2~6", help='~ separated list of classes for the lsun data set')
+parser.add_argument('--amodal', type=int, default=0, help='which amodal type to use. 0 no amodal, 1 amodal without moving to center, 2 amodal with object to center')
 
 opt = parser.parse_args()
 print(opt)
@@ -76,9 +80,15 @@ torch.manual_seed(opt.manualSeed)
 if torch.cuda.is_available() and not opt.cuda:
     print("WanING: You have a CUDA device, so you should probably run with --cuda")
 
+if opt.dataset == "bird":
+    train_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=True)
+    test_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=False)
+elif opt.dataset == "co3d":
+    train_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=True, categories=["bottle"], amodal=opt.amodal)
+    test_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=False, categories=["bottle"], amodal=opt.amodal)
+else:
+    raise NotImplementedError
 
-train_dataset = Dataset(opt.dataroot, opt.imageSize, train=True)
-test_dataset = Dataset(opt.dataroot, opt.imageSize, train=False)
 
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batchSize,
                                          shuffle=True, drop_last=True, pin_memory=True, num_workers=int(opt.workers))
@@ -262,6 +272,8 @@ class DiffRender(object):
         pred_img = pred_data[:, :3]
         pred_mask = pred_data[:, 3]
         gt_img = gt_data[:, :3]
+        # gt_seg = gt_data[:, 3].unsqueeze(1)
+        # gt_img = gt_img * gt_seg + torch.ones_like(gt_img) * (1 - gt_seg)
         gt_mask = gt_data[:, 3]
         loss_image = torch.mean(torch.abs(pred_img - gt_img))
         loss_mask = kal.metrics.render.mask_iou(pred_mask, gt_mask)
@@ -508,12 +520,69 @@ if __name__ == '__main__':
                 ###########################
                 optimizerD.zero_grad()
                 Xa = Variable(data['data']['images']).cuda()
-
                 Ea = Variable(data['data']['edge']).cuda()
                 batch_size = Xa.shape[0]
 
+                if opt.amodal:
+                    # Random mask Xa to simulate occulusion
+                    Xb = Variable(data['data']['original_images']).cuda()
+                    mask = Xb[:, -1, :, :]
+                    rgb = Xb[:, :3, :, :]
+                    for i, (m, r) in enumerate(zip(mask, rgb)):
+                        y, x = torch.where(m)
+                        # print(len(y), len(x))
+                        if len(y) == 0 or len(x) == 0:
+                            continue
+                        ymin, ymax = y.min(), y.max()
+                        xmin, xmax = x.min(), x.max()
+                        h = ymax - ymin
+                        w = xmax - xmin
+                        s_x, s_h = random.randint(w // 2, w), random.randint(h // 2, h)
+
+                        # only do mask half of the time
+                        if random.uniform(0, 1) < 0.5:
+                            if random.uniform(0, 1) < 0.5:
+                                # mask according to x
+                                # print(s_x, w / 2)
+                                if s_x > w / 2:
+                                    m[:, xmin + s_x:] = 0
+                                    r[:, :, xmin + s_x:] = 1
+                                else:
+                                    m[:, :xmin + s_x] = 0
+                                    r[:, :, :xmin + s_x] = 1
+                            else:
+                                # mask according to y
+                                # print(s_h, h / 2)
+                                if s_h > h / 2:
+                                    m[ymin + s_h:, :] = 0
+                                    r[:, ymin + s_h:, :] = 1
+                                else:
+                                    m[:ymin + s_h, :] = 0
+                                    r[:, :ymin + s_h, :] = 1
+
+                        # print(opt.amodal)
+                        if opt.amodal == 2:
+                            yy, xx = np.where(m.cpu().numpy())
+                            ymin, ymax = yy.min(), yy.max()
+                            xmin, xmax = xx.min(), xx.max()
+
+                            c_new = [(xmax + xmin) // 2, (ymin + ymax) // 2]
+                            c_old = [opt.imageSize // 2, opt.imageSize // 2]
+                            translate = np.array(c_old) - np.array(c_new)
+
+                            translated_Xb = torchvision.transforms.functional.affine(Xb[i], 0, translate.tolist(), 1, 0)
+                            Xb[i][:3] = translated_Xb[:3, :, :] * translated_Xb[[3], :, :] + torch.ones_like(translated_Xb[:3, :, :]) * (1 - translated_Xb[[3], :, :])
+                            Xb[i][-1] = translated_Xb[-1]
+
+                            translated_Xa = torchvision.transforms.functional.affine(Xa[i], 0, translate.tolist(), 1, 0)
+                            Xa[i][:3] = translated_Xa[:3, :, :] * translated_Xa[[3], :, :] + torch.ones_like(translated_Xa[:3, :, :]) * (1 - translated_Xa[[3], :, :])
+                            Xa[i][-1] = translated_Xa[-1]
+
+                else:
+                    Xb = Variable(data['data']['original_images']).cuda()
+
                 # encode real
-                Ae = netE(Xa)
+                Ae = netE(Xb)
                 Xer, Ae = diffRender.render(**Ae)
 
                 rand_a = torch.randperm(batch_size)
@@ -577,6 +646,7 @@ if __name__ == '__main__':
                 lossR_reg = opt.lambda_reg * (diffRender.calc_reg_loss(Ae) +  diffRender.calc_reg_loss(Ai)) / 2.0
                 # lossR_flip = 0.002 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai))
                 lossR_flip = 0.1 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai) + diffRender.recon_flip(Aire)) / 3.0
+                # lossR_flip = torch.zeros_like(lossR_reg)
 
                 # interpolated cycle consistency
                 loss_cam, loss_shape, loss_texture, loss_light = diffRender.recon_att(Aire, deep_copy(Ai, detach=True))
@@ -656,6 +726,11 @@ if __name__ == '__main__':
                     '%s/epoch_%03d_Iter_%04d_Xa.png' % (opt.outf, epoch, iter), normalize=True)
             vutils.save_image(Xa[:, :3],
                     '%s/current_Xa.png' % (opt.outf), normalize=True)
+            
+            vutils.save_image(Xb[:, :3],
+                    '%s/epoch_%03d_Iter_%04d_Xb.png' % (opt.outf, epoch, iter), normalize=True)
+            vutils.save_image(Xb[:, :3],
+                    '%s/current_Xb.png' % (opt.outf), normalize=True)
 
             vutils.save_image(Xer[:, :3].detach(),
                     '%s/epoch_%03d_Iter_%04d_Xer.png' % (opt.outf, epoch, iter), normalize=True)
