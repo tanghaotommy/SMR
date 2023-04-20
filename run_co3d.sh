@@ -15,7 +15,7 @@
 
 # pixar, learnaccel, learnfair, scavenge
 
-#SBATCH --partition=pixar
+#SBATCH --partition=eht
 
 #SBATCH --nodes=1
 
@@ -56,7 +56,7 @@ srun  python train.py --imageSize 128 \
                     --dataset co3d \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/Bird/SMR_co3d_half_amodal \
+                    --outf ./log/MeshFormer/SMR\
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \
@@ -65,4 +65,4 @@ srun  python train.py --imageSize 128 \
                     --lambda_data 1.0 \
                     --lambda_ic 0.1 \
                     --lambda_lc 0.001 \
-                    --amodal 2
+                    # --amodal 2

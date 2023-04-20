@@ -47,15 +47,17 @@ export CUDA_HOME=/public/apps/cuda/11.3/
 
 cd /checkpoint/haotang/dev/SMR/
 
+# export DATA_ROOT=/datasets01/co3d/081922
 export DATA_ROOT=/checkpoint/haotang/data/CUB_Data
 export CUDA_LAUNCH_BLOCKING=1.
 srun  python train.py --imageSize 128 \
                     --batchSize 24 \
                     --lr 0.0001 \
                     --niter 500 \
+                    --dataset bird \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/Bird/SMR_amodal \
+                    --outf ./log/MeshFormer/MeshFormer_no_texture\
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \
@@ -63,4 +65,6 @@ srun  python train.py --imageSize 128 \
                     --lambda_reg 1.0 \
                     --lambda_data 1.0 \
                     --lambda_ic 0.1 \
-                    --lambda_lc 0.001
+                    --lambda_lc 0.001 \
+                    --model MeshFormer
+                    # --amodal 2

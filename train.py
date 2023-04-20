@@ -35,6 +35,7 @@ from datasets.bird import Dataset as BirdDataset
 from datasets.co3d import Co3DDataset
 from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder
+from models.meshformer import MeshFormer
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -66,10 +67,10 @@ parser.add_argument('--azi_scope', type=float, default=360, help='parameter')
 parser.add_argument('--elev_range', type=str, default="0~30", help='~ separated list of classes for the lsun data set')
 parser.add_argument('--dist_range', type=str, default="2~6", help='~ separated list of classes for the lsun data set')
 parser.add_argument('--amodal', type=int, default=0, help='which amodal type to use. 0 no amodal, 1 amodal without moving to center, 2 amodal with object to center')
+parser.add_argument('--model', help='model name', default='SMR')
 
 opt = parser.parse_args()
 print(opt)
-
 
 if opt.manualSeed is None:
     opt.manualSeed = random.randint(1, 10000)
@@ -372,13 +373,63 @@ class AttributeEncoder(nn.Module):
         cameras = self.camera_enc(input_img)
         azimuths, elevations, distances = cameras
 
+        # textures
+        textures = self.texture_enc(input_img)
+
         # vertex
         delta_vertices = self.shape_enc(input_img)
         vertices = self.vertices_init[None].to(device) + delta_vertices
 
+        lights = self.light_enc(input_img)
+
+        # image feat
+        with torch.no_grad():
+            self.feat_enc.eval()
+            img_feats = self.feat_enc(input_img)
+
+        # others
+        attributes = {
+        'azimuths': azimuths,
+        'elevations': elevations,
+        'distances': distances,
+        'vertices': vertices,
+        'delta_vertices': delta_vertices,
+        'textures': textures,
+        'lights': lights,
+        'img_feats': img_feats
+        }
+        return attributes
+
+
+class MeshFormerEncoder(nn.Module):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk):
+        super(MeshFormerEncoder, self).__init__()
+        self.num_vertices = num_vertices
+        self.vertices_init = vertices_init
+
+        self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
+        self.meshformer = MeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range)
+        self.texture_enc = TextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
+        # self.feat_enc = FeatEncoder(nc=4, nf=32)
+        self.feat_enc = VGG19()
+
+    def forward(self, x):
+        device = x.device
+        batch_size = x.shape[0]
+        input_img = x
+
+        # meshformer
+        delta_vertices, cameras, lights, textures = self.meshformer(input_img)
+
+        # # cameras
+        # cameras = self.camera_enc(input_img)
+        azimuths, elevations, distances = cameras
+
         # textures
         textures = self.texture_enc(input_img)
-        lights = self.light_enc(input_img)
+
+        # vertex
+        vertices = self.vertices_init[None].to(device) + delta_vertices
 
         # image feat
         with torch.no_grad():
@@ -447,10 +498,17 @@ if __name__ == '__main__':
     # differentiable renderer
     diffRender = DiffRender(filename_obj=opt.template_path, image_size=opt.imageSize)
 
-    # netE: 3D attribute encoder: Camera, Light, Shape, and Texture
-    netE = AttributeEncoder(num_vertices=diffRender.num_vertices, vertices_init=diffRender.vertices_init, 
-                            azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range, 
-                            nc=4, nk=opt.nk, nf=opt.nf)
+    if opt.model == "SMR":
+        # netE: 3D attribute encoder: Camera, Light, Shape, and Texture
+        netE = AttributeEncoder(num_vertices=diffRender.num_vertices, vertices_init=diffRender.vertices_init, 
+                                azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range, 
+                                nc=4, nk=opt.nk, nf=opt.nf)
+    elif opt.model == "MeshFormer":
+        netE = MeshFormerEncoder(num_vertices=diffRender.num_vertices, vertices_init=diffRender.vertices_init, 
+                                azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range,
+                                nc=4, nk=opt.nk, nf=opt.nf)
+    else:
+        raise NotImplementedError
 
     if opt.multigpus:
         netE = torch.nn.DataParallel(netE)
@@ -525,7 +583,7 @@ if __name__ == '__main__':
 
                 if opt.amodal:
                     # Random mask Xa to simulate occulusion
-                    Xb = Variable(data['data']['original_images']).cuda()
+                    Xb = Variable(data['data']['images']).cuda()
                     mask = Xb[:, -1, :, :]
                     rgb = Xb[:, :3, :, :]
                     for i, (m, r) in enumerate(zip(mask, rgb)):
@@ -579,7 +637,7 @@ if __name__ == '__main__':
                             Xa[i][-1] = translated_Xa[-1]
 
                 else:
-                    Xb = Variable(data['data']['original_images']).cuda()
+                    Xb = Variable(data['data']['images']).cuda()
 
                 # encode real
                 Ae = netE(Xb)
@@ -795,6 +853,7 @@ if __name__ == '__main__':
 
         if epoch % 20 == 0 and epoch > 0:
             netE.eval()
+            mask_ious = []
             for i, data in tqdm.tqdm(enumerate(test_dataloader)):
                 Xa = Variable(data['data']['images']).cuda()
                 paths = data['data']['path']
@@ -821,6 +880,17 @@ if __name__ == '__main__':
                         ori_path = os.path.join(ori_dir, image_name)
                         output_Xa = to_pil_image(Xa[i, :3].detach().cpu())
                         output_Xa.save(ori_path, 'JPEG', quality=100)
+
+                        gt_mask = Xa[i, 3].detach().cpu()
+                        pred_mask = Xer[i, 3].detach().cpu()
+                        loss_mask = kal.metrics.render.mask_iou(pred_mask.unsqueeze(0), gt_mask.unsqueeze(0)).item()
+
+                        mask_ious.append(1 - loss_mask)
+
+            mask_iou = np.mean(mask_ious)
+            print('Test mask iou: %0.2f' % mask_iou)
+            summary_writer.add_scalar('Test/mask_iou', mask_iou, epoch)
+
             fid_recon = calculate_fid_given_paths([ori_dir, rec_dir], 32, True)
             print('Test recon fid: %0.2f' % fid_recon)
             summary_writer.add_scalar('Test/fid_recon', fid_recon, epoch)
