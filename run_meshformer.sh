@@ -48,16 +48,17 @@ export CUDA_HOME=/public/apps/cuda/11.3/
 cd /checkpoint/haotang/dev/SMR/
 
 # export DATA_ROOT=/datasets01/co3d/081922
-export DATA_ROOT=/checkpoint/haotang/data/CUB_Data
+export DATA_ROOT=/checkpoint/haotang/data/shapenet_multiview_10
+# export DATA_ROOT=/checkpoint/haotang/data/CUB_Data
 export CUDA_LAUNCH_BLOCKING=1.
-srun  python train.py --imageSize 128 \
+srun  python train_multiview.py --imageSize 128 \
                     --batchSize 24 \
                     --lr 0.0001 \
                     --niter 500 \
-                    --dataset bird \
+                    --dataset shapenet \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/MeshFormer/MeshFormer_no_texture\
+                    --outf ./log/MultiViewFormer/initial_shapenet_airplane_complete\
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \

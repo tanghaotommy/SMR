@@ -37,7 +37,7 @@ from datasets.co3d_seq import Co3DSeqDataset
 from datasets.shapenet import ShapeNetMultiView
 from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder
-from models.meshformer import MeshFormer
+from models.meshformer import MultiViewMeshFormer
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -87,14 +87,14 @@ if opt.dataset == "bird":
     train_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=True)
     test_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=False)
 elif opt.dataset == "co3d":
-    train_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=True, categories=["toyplane"], amodal=opt.amodal)
-    test_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=False, categories=["toyplane"], amodal=opt.amodal)
+    train_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=True, categories=["bottle"], amodal=opt.amodal)
+    test_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=False, categories=["bottle"], amodal=opt.amodal)
 elif opt.dataset == "co3d_seq":
-    train_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["bottle"], amodal=opt.amodal)
-    test_dataset = Co3DSeqDataset(opt.dataroot, "val", image_size=opt.imageSize, categories=["bottle"], amodal=opt.amodal)
+    train_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
+    test_dataset = Co3DSeqDataset(opt.dataroot, "val", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
 elif opt.dataset == "shapenet":
-    train_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"], num_views=1)
-    test_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"], num_views=1)
+    train_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"])
+    test_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"])
     test_dataset.object_path = test_dataset.object_path[:10]
 else:
     raise NotImplementedError
@@ -417,14 +417,14 @@ class MeshFormerEncoder(nn.Module):
         self.vertices_init = vertices_init
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
-        self.meshformer = MeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range)
+        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range)
         self.texture_enc = TextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
         # self.feat_enc = FeatEncoder(nc=4, nf=32)
         self.feat_enc = VGG19()
 
     def forward(self, x):
         device = x.device
-        batch_size = x.shape[0]
+        batch_size, num_views, C, H, W = x.shape
         input_img = x
 
         # meshformer
@@ -435,7 +435,9 @@ class MeshFormerEncoder(nn.Module):
         azimuths, elevations, distances = cameras
 
         # textures
-        textures = self.texture_enc(input_img)
+        l = np.array(range(0, batch_size*num_views, num_views))
+        textures = self.texture_enc(input_img.view(batch_size * num_views, C, H, W)[l])
+        textures = textures.repeat_interleave(num_views, dim=0)
 
         # vertex
         vertices = self.vertices_init[None].to(device) + delta_vertices
@@ -443,7 +445,7 @@ class MeshFormerEncoder(nn.Module):
         # image feat
         with torch.no_grad():
             self.feat_enc.eval()
-            img_feats = self.feat_enc(input_img)
+            img_feats = self.feat_enc(input_img.view(batch_size * num_views, C, H, W))
 
         # others
         attributes = {
@@ -648,12 +650,21 @@ if __name__ == '__main__':
                 else:
                     Xb = Variable(data['data']['images']).cuda()
 
+                batch_size, num_views, C, H, W = Xb.shape
+                # sample views from each object for cross-instance loss
+
+
                 # encode real
                 Ae = netE(Xb)
                 Xer, Ae = diffRender.render(**Ae)
 
-                rand_a = torch.randperm(batch_size)
-                rand_b = torch.randperm(batch_size)
+                # Get the first view for each object
+                l = np.array(range(0, batch_size*num_views, num_views))
+                original = l.copy()
+                np.random.shuffle(l)
+                rand_a = l.copy()
+                np.random.shuffle(l)
+                rand_b = l.copy()
                 Aa = deep_copy(Ae, rand_a)
                 Ab = deep_copy(Ae, rand_b)
                 Ai = {}
@@ -684,18 +695,18 @@ if __name__ == '__main__':
                 # interpolated 3D attributes render images, and update Ai
                 Xir, Ai = diffRender.render(**Ai)
                 # predicted 3D attributes from above render images 
-                Aire = netE(Xir.detach().clone())
+                Aire = netE(Xir.detach().clone().unsqueeze(1))
                 # render again to update predicted 3D Aire 
                 _, Aire = diffRender.render(**Aire)
 
                 # discriminate loss
-                lossD_real = opt.lambda_gan * (-netD(Xa.detach().clone()).mean())
-                lossD_fake = opt.lambda_gan * (netD(Xer.detach().clone()).mean() + \
+                lossD_real = opt.lambda_gan * (-netD(Xa.detach().clone().view(batch_size * num_views, C, H, W)[original]).mean())
+                lossD_fake = opt.lambda_gan * (netD(Xer.detach().clone()[original]).mean() + \
                                             netD(Xir.detach().clone()).mean()) / 2.0
 
                 # WGAN-GP
-                lossD_gp = 10.0 * opt.lambda_gan * (compute_gradient_penalty(netD, Xa.data, Xer.data) + \
-                                            compute_gradient_penalty(netD, Xa.data, Xir.data)) / 2.0
+                lossD_gp = 10.0 * opt.lambda_gan * (compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xer[original].data) + \
+                                            compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xir.data)) / 2.0
 
                 lossD = lossD_real + lossD_fake + lossD_gp
                 lossD.backward()
@@ -706,8 +717,8 @@ if __name__ == '__main__':
                 ###########################
                 optimizerE.zero_grad()
                 # GAN loss
-                lossR_fake = opt.lambda_gan * (-netD(Xer).mean() - netD(Xir).mean()) / 2.0
-                lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa)
+                lossR_fake = opt.lambda_gan * (-netD(Xer[original]).mean() - netD(Xir).mean()) / 2.0
+                lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa.view(batch_size * num_views, C, H, W))
 
                 # mesh regularization
                 lossR_reg = opt.lambda_reg * (diffRender.calc_reg_loss(Ae) +  diffRender.calc_reg_loss(Ai)) / 2.0
@@ -720,11 +731,11 @@ if __name__ == '__main__':
                 lossR_IC = opt.lambda_ic * (loss_cam + loss_shape + loss_texture + loss_light)
 
                 # landmark consistency
-                Le = Ae['faces_image']
+                Le = Ae['faces_image'][original]
                 Li = Aire['faces_image']
-                Fe = Ae['img_feats']
+                Fe = Ae['img_feats'][original]
                 Fi = Aire['img_feats']
-                Ve = Ae['visiable_faces']
+                Ve = Ae['visiable_faces'][original]
                 Vi = Aire['visiable_faces']
                 lossR_LC = opt.lambda_lc * (netL(Fe, Le, Ve).mean() + netL(Fi, Li, Vi).mean())
                 
@@ -765,7 +776,7 @@ if __name__ == '__main__':
             num_images = Xa.shape[0]
             textures = Ae['textures']
 
-            Xa = (Xa * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+            Xa = (Xa * 255).view(batch_size * num_views, C, H, W).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
             Xer = (Xer * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
             Xir = (Xir * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
 
@@ -790,19 +801,19 @@ if __name__ == '__main__':
                     '%s/current_randperm_Xb.png' % (opt.outf), normalize=True)
 
             vutils.save_image(Xa[:, :3],
-                    '%s/epoch_%03d_Iter_%04d_Xa.png' % (opt.outf, epoch, iter), normalize=True)
+                    '%s/epoch_%03d_Iter_%04d_Xa.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
             vutils.save_image(Xa[:, :3],
-                    '%s/current_Xa.png' % (opt.outf), normalize=True)
+                    '%s/current_Xa.png' % (opt.outf), normalize=True, nrow=num_views)
             
-            vutils.save_image(Xb[:, :3],
-                    '%s/epoch_%03d_Iter_%04d_Xb.png' % (opt.outf, epoch, iter), normalize=True)
-            vutils.save_image(Xb[:, :3],
-                    '%s/current_Xb.png' % (opt.outf), normalize=True)
+            vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
+                    '%s/epoch_%03d_Iter_%04d_Xb.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
+            vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
+                    '%s/current_Xb.png' % (opt.outf), normalize=True, nrow=num_views)
 
             vutils.save_image(Xer[:, :3].detach(),
-                    '%s/epoch_%03d_Iter_%04d_Xer.png' % (opt.outf, epoch, iter), normalize=True)
+                    '%s/epoch_%03d_Iter_%04d_Xer.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
             vutils.save_image(Xer[:, :3].detach(),
-                    '%s/current_Xer.png' % (opt.outf), normalize=True)
+                    '%s/current_Xer.png' % (opt.outf), normalize=True, nrow=num_views)
 
             vutils.save_image(Xir[:, :3].detach(),
                     '%s/epoch_%03d_Iter_%04d_Xir.png' % (opt.outf, epoch, iter), normalize=True)
@@ -812,10 +823,10 @@ if __name__ == '__main__':
             vutils.save_image(textures.detach(),
                     '%s/current_textures.png' % (opt.outf), normalize=True)
 
-            vutils.save_image(Ea.detach(),
+            vutils.save_image(Ea.view(batch_size * num_views, 1, H, W).detach(),
                     '%s/current_edge.png' % (opt.outf), normalize=True)
 
-            Ae = deep_copy(Ae, detach=True)
+            Ae = deep_copy(Ae, index=original, detach=True)
             vertices = Ae['vertices']
             faces = diffRender.faces
             textures = Ae['textures']
@@ -871,12 +882,16 @@ if __name__ == '__main__':
                     Ae = netE(Xa)
                     Xer, Ae = diffRender.render(**Ae)
 
-                    Ai = deep_copy(Ae)
+                    batch_size, num_views, C, H, W = Xa.shape
+
+                    # Get the first view for each object
+                    l = np.array(range(0, batch_size*num_views, num_views))
+                    Ai = deep_copy(Ae, index=l)
                     Ai['azimuths'] = - torch.empty((Xa.shape[0]), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
                     Xir, Ai = diffRender.render(**Ai)
 
                     for i in range(len(paths)):
-                        path = paths[i]
+                        path = paths[i][0] # only sample the first view for each multi-view input
                         image_name = os.path.basename(path)
                         rec_path = os.path.join(rec_dir, image_name)
                         output_Xer = to_pil_image(Xer[i, :3].detach().cpu())
@@ -887,11 +902,11 @@ if __name__ == '__main__':
                         output_Xir.save(inter_path, 'JPEG', quality=100)
 
                         ori_path = os.path.join(ori_dir, image_name)
-                        output_Xa = to_pil_image(Xa[i, :3].detach().cpu())
+                        output_Xa = to_pil_image(Xa[i, 0, :3].detach().cpu())
                         output_Xa.save(ori_path, 'JPEG', quality=100)
 
-                        gt_mask = Xa[i, 3].detach().cpu()
-                        pred_mask = Xer[i, 3].detach().cpu()
+                        gt_mask = Xa[i, 0, 3].detach().cpu()
+                        pred_mask = Xer[i * num_views, 3].detach().cpu()
                         loss_mask = kal.metrics.render.mask_iou(pred_mask.unsqueeze(0), gt_mask.unsqueeze(0)).item()
 
                         mask_ious.append(1 - loss_mask)

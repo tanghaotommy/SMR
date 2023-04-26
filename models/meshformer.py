@@ -53,7 +53,7 @@ class CameraDecoder(nn.Module):
         ]
         return block2
 
-    def forward(self, memory, pos_embed, mask):
+    def forward(self, tgt, memory, pos_embed, mask):
         batch_size = memory.shape[1]
         # memory = memory.permute(1, 2, 0).contiguous().view(batch_size, 256, 8, 8)
         # camera_output = self.avg_pool(memory).view(batch_size, -1)
@@ -65,7 +65,8 @@ class CameraDecoder(nn.Module):
         query_embed = query_embed.unsqueeze(1).repeat(
             1, batch_size, 1
         )
-        tgt = torch.zeros_like(query_embed)
+        if tgt is None:
+            tgt = torch.zeros_like(query_embed)
         decoder_output = self.decoder(
             tgt,
             memory,
@@ -418,6 +419,196 @@ class MeshFormer(nn.Module):
         lights = self.light_decoder(memory, pos_embed, mask)
         textures = None
         # textures = self.texture_decoder(memory, pos_embed, mask)
+        return delta_vertices, cameras, lights, textures
+
+
+class MultiViewMeshFormer(nn.Module):
+    """This is the base class for Transformer based mesh reconstruction"""
+
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range):
+        """Initializes the model.
+        Parameters:
+            backbone: torch module of the backbone to be used. See backbone.py
+            transformer: torch module of the transformer architecture. See transformer.py
+            num_queries: number of object queries.
+            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+        """
+        super().__init__()
+        self.num_vertices = num_vertices
+        self.vertices_init = vertices_init
+
+        self.backbone = build_backbone("resnet18")
+        # self.transformer = build_transformer(nheads=4, enc_layers=2, dec_layers=2)
+        hidden_dim = 256
+        pre_norm = False
+
+        d_model=hidden_dim
+        dropout=0.1
+        nhead=2
+        dim_feedforward=2048
+        num_encoder_layers = 2
+        num_decoder_layers = 2
+        normalize_before=pre_norm,
+        return_intermediate_dec=False
+        divide_norm=False
+        activation="relu"
+        encoder_layer = TransformerEncoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            normalize_before,
+            divide_norm=divide_norm,
+        )
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        self.encoder = TransformerEncoder(
+            encoder_layer, num_encoder_layers, encoder_norm
+        )
+
+        self.bottleneck = nn.Conv2d(
+            self.backbone.num_channels, hidden_dim, kernel_size=1
+        ) 
+        self._reset_parameters()
+
+        # shape decoder
+        decoder_layer = TransformerDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            normalize_before,
+            divide_norm=divide_norm,
+        )
+        decoder_norm = nn.LayerNorm(d_model)
+
+        decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            decoder_norm,
+            return_intermediate=return_intermediate_dec,
+        )
+        self.shape_decoder = ShapeDecoder(hidden_dim, decoder, num_vertices)
+
+        # camera decoder
+        decoder_layer = TransformerDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            normalize_before,
+            divide_norm=divide_norm,
+        )
+        decoder_norm = nn.LayerNorm(d_model)
+
+        decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            decoder_norm,
+            return_intermediate=return_intermediate_dec,
+        )
+        self.camera_decoder = CameraDecoder(hidden_dim, decoder, azi_scope, elev_range, dist_range)
+
+        # light decoder
+        decoder_layer = TransformerDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            normalize_before,
+            divide_norm=divide_norm,
+        )
+        decoder_norm = nn.LayerNorm(d_model)
+
+        decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            decoder_norm,
+            return_intermediate=return_intermediate_dec,
+        )
+        self.light_decoder = LightDecoder(hidden_dim, decoder)
+
+        # texture decoder
+        decoder_layer = TransformerDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            normalize_before,
+            divide_norm=divide_norm,
+        )
+        decoder_norm = nn.LayerNorm(d_model)
+
+        decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            decoder_norm,
+            return_intermediate=return_intermediate_dec,
+        )
+        self.texture_decoder = TextureDecoder(hidden_dim, decoder)
+
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def adjust(self, output_back: List, pos_embed: List):
+        """ """
+        src_feat, mask = output_back[-1].decompose()
+        assert mask is not None
+        # reduce channel
+        feat = self.bottleneck(src_feat)  # (B, C, H, W)
+        # adjust shapes
+        feat_vec = feat.flatten(2).permute(2, 0, 1)  # HWxBxC
+        pos_embed_vec = pos_embed[-1].flatten(2).permute(2, 0, 1)  # HWxBxC
+        mask_vec = mask.flatten(1)  # BxHW
+        return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
+
+    def forward(self, x):
+        device = x.device
+        batch_size, num_views, C, H, W = x.shape
+
+        x = x.view(batch_size * num_views, C, H, W)
+        if not isinstance(x, NestedTensor):
+            m = torch.zeros_like(x)
+            m = m[:, 0, :, :]
+            x = NestedTensor(x, m)
+            # only need it for each pixel
+            
+        output_back, pos = self.backbone(
+            x 
+        )
+        output = self.adjust(output_back, pos)
+        feat = output["feat"]
+        mask = output["mask"]
+        pos_embed = output["pos"]
+        
+        HW, _, dim = feat.shape
+        tgt = feat.permute(1, 2, 0).contiguous()
+        tgt = self.avg_pool(tgt)
+        tgt = tgt.permute(2, 0, 1).contiguous()
+        feat = feat.view(HW, batch_size, num_views, dim).permute(0, 2, 1, 3).contiguous().view(HW * num_views, batch_size, dim)
+        mask = mask.view(batch_size, num_views * HW)
+        pos_embed = pos_embed.view(HW, batch_size, num_views, dim).permute(0, 2, 1, 3).contiguous().view(HW * num_views, batch_size, dim)
+
+        memory = self.encoder(feat, src_key_padding_mask=mask, pos=pos_embed)
+
+        delta_vertices = self.shape_decoder(memory, self.vertices_init.to(device), pos_embed, mask)
+        cameras = self.camera_decoder(tgt, memory.repeat_interleave(num_views, dim=1), pos_embed.repeat_interleave(num_views, dim=1), mask.repeat_interleave(num_views, dim=0))
+        lights = self.light_decoder(memory, pos_embed, mask)
+        textures = None
+        # textures = self.texture_decoder(memory, pos_embed, mask)
+
+        # repeat shape prediction for every item
+        delta_vertices = delta_vertices.repeat_interleave(num_views, dim=0)
+        lights = lights.repeat_interleave(num_views, dim=0)
+
         return delta_vertices, cameras, lights, textures
 
 
