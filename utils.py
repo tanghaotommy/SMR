@@ -62,6 +62,18 @@ def camera_position_from_spherical_angles(dist, elev, azim, degrees=True):
     return camera_position.reshape(-1, 3)
 
 
+def spherical_angles_from_camera_position(xyz):
+    """
+    Return as degrees for azimuth and elev
+    """
+    xy = xyz[:,0]**2 + xyz[:,2]**2
+    dist = torch.sqrt(xy + xyz[:,1]**2)
+    elev = torch.arctan2(xyz[:,1], torch.sqrt(xy)) * 180 / math.pi
+    azim = torch.arctan2(xyz[:,0], xyz[:,2]) * 180 / math.pi
+    
+    return [azim, elev, dist]
+
+
 def generate_transformation_matrix(camera_position, look_at, camera_up_direction):
     r"""Generate transformation matrix for given camera parameters.
 

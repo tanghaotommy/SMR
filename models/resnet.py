@@ -47,6 +47,7 @@ class ResNet(nn.Module):
         replace_stride_with_dilation=None,
         norm_layer=None,
         last_layer=None,
+        input_dim=3,
     ):
         super(ResNet, self).__init__()
         assert last_layer in ["layer1", "layer2", "layer3", "layer4", "fc"]
@@ -69,7 +70,7 @@ class ResNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
         self.conv1 = nn.Conv2d(
-            4, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False
+            input_dim, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False
         )
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)

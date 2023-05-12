@@ -127,6 +127,7 @@ class Backbone(BackboneBase):
         freeze_bn: bool,
         ckpt_path=None,
         pretrained=True,
+        input_dim=3,
     ):
         if "resnet" in name:
             norm_layer = FrozenBatchNorm2d if freeze_bn else nn.BatchNorm2d
@@ -136,6 +137,7 @@ class Backbone(BackboneBase):
                 pretrained=pretrained,
                 norm_layer=norm_layer,
                 last_layer="layer3",
+                input_dim=input_dim
             )
             num_channels = 256 if name in ("resnet18", "resnet34") else 1024
             net_type = "resnet"

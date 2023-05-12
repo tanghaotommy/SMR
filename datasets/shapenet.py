@@ -60,6 +60,9 @@ class ShapeNetMultiView(Dataset):
         original_rgbs = torch.stack([d[1] for d in preprocessed_data], dim=0).squeeze(0)
         edge = torch.stack([d[2] for d in preprocessed_data], dim=0).squeeze(0)
         path = [f"{a.split('/')[-1]}" for a in img_paths]
+        poses = [[int(p.split(".")[0]), 30, 3] for p in path]   # azimuths, elevations, distances
+        poses = torch.FloatTensor(poses)
+        poses[:, 0] = (((poses[:, 0] + 180) - poses[0, 0]) % 360) - 180
         if len(path) == 1:
             path = path[0]
         
@@ -68,7 +71,8 @@ class ShapeNetMultiView(Dataset):
             "original_images": original_rgbs,
             "edge": edge,
             "path": path,
-            "label": "unavailable"
+            "label": "unavailable",
+            "poses": poses,
         }
         return {"data": data}
 

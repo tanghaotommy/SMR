@@ -58,7 +58,7 @@ srun  python train_multiview.py --imageSize 128 \
                     --dataset shapenet \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/MultiViewFormer/initial_shapenet_airplane_complete\
+                    --outf ./log/MultiViewFormer/initial_shapenet_airplane_gt_poses_conanical_FORGE_pose_estimator_shared_encoder_use_pred_pose_rendering_quat\
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \

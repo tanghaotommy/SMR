@@ -45,7 +45,7 @@ import multiprocessing
 device = torch.device("cpu")
 
 class ShapeNetMultiView(Dataset):
-    def __init__(self, data_path, category_ids=["02691156"], num_views=5, distance=1, elevation=30):
+    def __init__(self, data_path, category_ids=["02691156"], num_views=5, distance=1, elevation=30, random=False):
         shapenet_dataset = ShapeNetCore(data_path, version=2)
         self.id_lists = [i for i in range(len(shapenet_dataset)) if shapenet_dataset.synset_ids[i] in category_ids]
         self.shapenet_dataset = shapenet_dataset
@@ -67,7 +67,10 @@ class ShapeNetMultiView(Dataset):
         # elev = torch.linspace(0, 360, num_views)
 
         if num_views > 1:
-            azim = torch.linspace(-180, 180, num_views)
+            if random:
+                azim = torch.randint(-180, 181, (num_views,))
+            else:
+                azim = torch.linspace(-180, 180, num_views)
         else:
             azim = [random.randint(-180, 180)]
 
@@ -111,7 +114,7 @@ num_views = 10
 SHAPENET_PATH = "/datasets01/ShapeNetCore.v2/080320"
 category_id = "02691156"
 shapenet_mv = ShapeNetMultiView(SHAPENET_PATH, num_views=10, category_ids=[category_id])
-save_dir = f"/checkpoint/haotang/data/shapenet_multiview_{num_views}/{category_id}"
+save_dir = f"/checkpoint/haotang/data/shapenet_multiview_random_{num_views}/{category_id}"
 
 
 def process_single(id):

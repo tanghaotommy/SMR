@@ -35,9 +35,12 @@ from datasets.bird import Dataset as BirdDataset
 from datasets.co3d import Co3DDataset
 from datasets.co3d_seq import Co3DSeqDataset
 from datasets.shapenet import ShapeNetMultiView
-from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer
+from geo_utils import mat2quat, get_relative_pose
+import geo_utils
+from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer, spherical_angles_from_camera_position
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder
 from models.meshformer import MultiViewMeshFormer
+from eval_utils import compute_pose_metric
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -54,7 +57,7 @@ parser.add_argument('--nk', type=int, default=5, help='size of kerner')
 parser.add_argument('--nf', type=int, default=32, help='dim of unit channel')
 parser.add_argument('--niter', type=int, default=500, help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.0001, help='leaning rate, default=0.0002')
-parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
+parser.add_argument('--beta1', type=float, default=0.9, help='beta1 for adam. default=0.9')
 parser.add_argument('--cuda', default=1, type=int, help='enables cuda')
 parser.add_argument('--manualSeed', type=int, default=0, help='manual seed')
 parser.add_argument('--start_epoch', type=int, default=0, help='start epoch')
@@ -419,20 +422,22 @@ class MeshFormerEncoder(nn.Module):
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
         self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range)
         self.texture_enc = TextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
+        self.light_enc = LightEncoder(nc=nc, nk=nk)
         # self.feat_enc = FeatEncoder(nc=4, nf=32)
         self.feat_enc = VGG19()
 
-    def forward(self, x):
+    def forward(self, x, gt_poses):
         device = x.device
         batch_size, num_views, C, H, W = x.shape
         input_img = x
 
         # meshformer
-        delta_vertices, cameras, lights, textures = self.meshformer(input_img)
+        delta_vertices, cameras, lights, textures, pred_cameras, pred_cameras_sphere = self.meshformer(input_img, gt_poses)
 
         # # cameras
         # cameras = self.camera_enc(input_img)
-        azimuths, elevations, distances = cameras
+        # azimuths, elevations, distances = cameras
+        azimuths, elevations, distances = pred_cameras_sphere
 
         # textures
         l = np.array(range(0, batch_size*num_views, num_views))
@@ -441,6 +446,9 @@ class MeshFormerEncoder(nn.Module):
 
         # vertex
         vertices = self.vertices_init[None].to(device) + delta_vertices
+
+        # lights
+        lights = self.light_enc(input_img.view(batch_size * num_views, C, H, W))
 
         # image feat
         with torch.no_grad():
@@ -456,7 +464,8 @@ class MeshFormerEncoder(nn.Module):
         'delta_vertices': delta_vertices,
         'textures': textures,
         'lights': lights,
-        'img_feats': img_feats
+        'img_feats': img_feats,
+        'pred_cameras': pred_cameras
         }
         return attributes
 
@@ -545,6 +554,7 @@ if __name__ == '__main__':
     # setup learning rate scheduler
     schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, T_max=opt.niter, eta_min=1e-6)
     schedulerE = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerE, T_max=opt.niter, eta_min=1e-6)
+    # schedulerE = torch.optim.lr_scheduler.StepLR(optimizerE, step_size=150, gamma=0.5)
 
     # if resume is True, restore from latest_ckpt.path
     start_iter = 0
@@ -590,6 +600,7 @@ if __name__ == '__main__':
                 optimizerD.zero_grad()
                 Xa = Variable(data['data']['images']).cuda()
                 Ea = Variable(data['data']['edge']).cuda()
+                gt_poses = data['data']['poses'].cuda()
                 batch_size = Xa.shape[0]
 
                 if opt.amodal:
@@ -655,7 +666,7 @@ if __name__ == '__main__':
 
 
                 # encode real
-                Ae = netE(Xb)
+                Ae = netE(Xb, gt_poses)
                 Xer, Ae = diffRender.render(**Ae)
 
                 # Get the first view for each object
@@ -669,91 +680,153 @@ if __name__ == '__main__':
                 Ab = deep_copy(Ae, rand_b)
                 Ai = {}
 
-                # linearly interpolate 3D attributes
-                if opt.lambda_ic > 0.0:
-                    # camera interpolation
-                    alpha_camera = torch.empty((batch_size), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                    Ai['azimuths'] = - torch.empty((batch_size), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
-                    Ai['elevations'] = alpha_camera * Aa['elevations'] + (1-alpha_camera) * Ab['elevations']
-                    Ai['distances'] = alpha_camera * Aa['distances'] + (1-alpha_camera) * Ab['distances']
+                # # linearly interpolate 3D attributes
+                # if opt.lambda_ic > 0.0:
+                #     # camera interpolation
+                #     alpha_camera = torch.empty((batch_size), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
+                #     Ai['azimuths'] = - torch.empty((batch_size), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
+                #     Ai['elevations'] = alpha_camera * Aa['elevations'] + (1-alpha_camera) * Ab['elevations']
+                #     Ai['distances'] = alpha_camera * Aa['distances'] + (1-alpha_camera) * Ab['distances']
 
-                    # shape interpolation
-                    alpha_shape = torch.empty((batch_size, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                    Ai['vertices'] = alpha_shape * Aa['vertices'] + (1-alpha_shape) * Ab['vertices']
-                    Ai['delta_vertices'] = alpha_shape * Aa['delta_vertices'] + (1-alpha_shape) * Ab['delta_vertices']
+                #     # shape interpolation
+                #     alpha_shape = torch.empty((batch_size, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
+                #     Ai['vertices'] = alpha_shape * Aa['vertices'] + (1-alpha_shape) * Ab['vertices']
+                #     Ai['delta_vertices'] = alpha_shape * Aa['delta_vertices'] + (1-alpha_shape) * Ab['delta_vertices']
 
-                    # texture interpolation
-                    alpha_texture = torch.empty((batch_size, 1, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                    Ai['textures'] = alpha_texture * Aa['textures'] + (1.0 - alpha_texture) * Ab['textures']
+                #     # texture interpolation
+                #     alpha_texture = torch.empty((batch_size, 1, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
+                #     Ai['textures'] = alpha_texture * Aa['textures'] + (1.0 - alpha_texture) * Ab['textures']
 
-                    # light interpolation
-                    alpha_light = torch.empty((batch_size, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                    Ai['lights'] = alpha_light * Aa['lights'] + (1.0 - alpha_light) * Ab['lights']
-                else:
-                    Ai = Ae
+                #     # light interpolation
+                #     alpha_light = torch.empty((batch_size, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
+                #     Ai['lights'] = alpha_light * Aa['lights'] + (1.0 - alpha_light) * Ab['lights']
+                # else:
+                #     Ai = Ae
 
-                # interpolated 3D attributes render images, and update Ai
-                Xir, Ai = diffRender.render(**Ai)
-                # predicted 3D attributes from above render images 
-                Aire = netE(Xir.detach().clone().unsqueeze(1))
-                # render again to update predicted 3D Aire 
-                _, Aire = diffRender.render(**Aire)
+                # # interpolated 3D attributes render images, and update Ai
+                # Xir, Ai = diffRender.render(**Ai)
+                # # predicted 3D attributes from above render images 
+                # Aire = netE(Xir.detach().clone().unsqueeze(1))
+                # # render again to update predicted 3D Aire 
+                # _, Aire = diffRender.render(**Aire)
 
-                # discriminate loss
-                lossD_real = opt.lambda_gan * (-netD(Xa.detach().clone().view(batch_size * num_views, C, H, W)[original]).mean())
-                lossD_fake = opt.lambda_gan * (netD(Xer.detach().clone()[original]).mean() + \
-                                            netD(Xir.detach().clone()).mean()) / 2.0
+                # # discriminate loss
+                # lossD_real = opt.lambda_gan * (-netD(Xa.detach().clone().view(batch_size * num_views, C, H, W)[original]).mean())
+                # lossD_fake = opt.lambda_gan * (netD(Xer.detach().clone()[original]).mean() + \
+                #                             netD(Xir.detach().clone()).mean()) / 2.0
 
-                # WGAN-GP
-                lossD_gp = 10.0 * opt.lambda_gan * (compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xer[original].data) + \
-                                            compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xir.data)) / 2.0
+                # # WGAN-GP
+                # lossD_gp = 10.0 * opt.lambda_gan * (compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xer[original].data) + \
+                #                             compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xir.data)) / 2.0
 
-                lossD = lossD_real + lossD_fake + lossD_gp
-                lossD.backward()
-                optimizerD.step()
+                # lossD = lossD_real + lossD_fake + lossD_gp
+                # lossD.backward()
+                # optimizerD.step()
 
                 ############################
                 # (2) Update G network
                 ###########################
                 optimizerE.zero_grad()
                 # GAN loss
-                lossR_fake = opt.lambda_gan * (-netD(Xer[original]).mean() - netD(Xir).mean()) / 2.0
+                # lossR_fake = opt.lambda_gan * (-netD(Xer[original]).mean() - netD(Xir).mean()) / 2.0
                 lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa.view(batch_size * num_views, C, H, W))
 
                 # mesh regularization
-                lossR_reg = opt.lambda_reg * (diffRender.calc_reg_loss(Ae) +  diffRender.calc_reg_loss(Ai)) / 2.0
+                lossR_reg = opt.lambda_reg * diffRender.calc_reg_loss(Ae)
                 # lossR_flip = 0.002 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai))
-                lossR_flip = 0.1 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai) + diffRender.recon_flip(Aire)) / 3.0
+                lossR_flip = 0.1 * diffRender.recon_flip(Ae)
                 # lossR_flip = torch.zeros_like(lossR_reg)
 
-                # interpolated cycle consistency
-                loss_cam, loss_shape, loss_texture, loss_light = diffRender.recon_att(Aire, deep_copy(Ai, detach=True))
-                lossR_IC = opt.lambda_ic * (loss_cam + loss_shape + loss_texture + loss_light)
+                # # interpolated cycle consistency
+                # loss_cam, loss_shape, loss_texture, loss_light = diffRender.recon_att(Aire, deep_copy(Ai, detach=True))
+                # lossR_IC = opt.lambda_ic * (loss_cam + loss_shape + loss_texture + loss_light)
 
-                # landmark consistency
-                Le = Ae['faces_image'][original]
-                Li = Aire['faces_image']
-                Fe = Ae['img_feats'][original]
-                Fi = Aire['img_feats']
-                Ve = Ae['visiable_faces'][original]
-                Vi = Aire['visiable_faces']
-                lossR_LC = opt.lambda_lc * (netL(Fe, Le, Ve).mean() + netL(Fi, Li, Vi).mean())
+                # # landmark consistency
+                # Le = Ae['faces_image'][original]
+                # Li = Aire['faces_image']
+                # Fe = Ae['img_feats'][original]
+                # Fi = Aire['img_feats']
+                # Ve = Ae['visiable_faces'][original]
+                # Vi = Aire['visiable_faces']
+                # lossR_LC = opt.lambda_lc * (netL(Fe, Le, Ve).mean() + netL(Fi, Li, Vi).mean())
                 
                 # overall loss
-                lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC
+                lossR_fake = torch.zeros(1).to(lossR_data.device)
+                lossR_LC = torch.zeros(1).to(lossR_data.device)
+                lossR_IC = torch.zeros(1).to(lossR_data.device)
+
+                device = Xb.device
+                poses_pred = Ae["pred_cameras"]
+                object_pos = torch.tensor([[0., 0., 0.]], dtype=torch.float, device=device).repeat(batch_size * (num_views), 1)
+                camera_up = torch.tensor([[0., 1., 0.]], dtype=torch.float, device=device).repeat(batch_size * (num_views), 1)
+                # camera_pos = torch.tensor([[0., 0., 4.]], dtype=torch.float, device=device).repeat(batch_size, 1)
+                distances = gt_poses[:, :, 2].flatten()
+                elevations = gt_poses[:, :, 1].flatten()
+                azimuths = gt_poses[:, :, 0].flatten()
+                camera_pos = camera_position_from_spherical_angles(distances, elevations, azimuths, degrees=True)
+                cam_transform = generate_transformation_matrix(camera_pos, object_pos, camera_up)
+                c = torch.tensor([[0., 0., 0., 1.]], dtype=torch.float, device=device).repeat(batch_size * (num_views), 1).unsqueeze(2)
+                cam_transform = torch.cat([cam_transform, c], dim=2)
+                cam_transform = cam_transform.permute(0, 2, 1)
+                
+                # get relative gt camera pose
+                gt_cam = cam_transform.view(batch_size, num_views, 4, 4)
+                gt_cam_rel = []
+
+                for c in gt_cam:
+                    canonical = c[0, :, :]
+                    gt_rel_poses = c[1:, :, :]
+                    c_r = get_relative_pose(canonical, gt_rel_poses)
+                    gt_cam_rel.append(c_r)
+
+                gt_cam_rel = torch.stack(gt_cam_rel).view(batch_size * (num_views - 1), 4, 4).to(device)
+
+                cam_quat = mat2quat(gt_cam_rel)
+                tmp = torch.zeros_like(poses_pred)
+                tmp[:,:4] = F.normalize(poses_pred[:,:4])
+                tmp[:,4:] = poses_pred[:,4:]
+                poses_pred = tmp
+
+                # pred camera pose to spherical coordinate
+                camPoseRel_cv2 = geo_utils.quat2mat(poses_pred)              # [b*(t-1),4,4], relative cam pose in cv2 frame
+                camPoseAbsolute = canonical.unsqueeze(0) @ camPoseRel_cv2
+
+                rot = camPoseAbsolute[:, :3, :3]
+                trans = camPoseAbsolute[:, :3, 3]
+                pred_camera_pos = (- trans.unsqueeze(1) @ rot).squeeze(1)
+                pred_cam_sphere = spherical_angles_from_camera_position(pred_camera_pos)
+                pred_cam_sphere = torch.stack(pred_cam_sphere, dim=1)
+
+                loss = 0.0
+                loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat[:,:4])
+                loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat[:,4:])
+                lossR_cam_quat = loss_pose + loss_trans
+                # lossR_cam = lossR_cam_quat
+                lossR_cam = F.mse_loss(pred_cam_sphere.view(batch_size, -1, 3), gt_poses[:, 1:, :])
+                # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam
+                # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC
+                lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
+                # lossR = lossR_cam_quat
+                rot_error, trans_error = 0.0, 0.0
+                for img_idx in range(len(cam_quat)):
+                    cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
+                                                                         cam_quat[img_idx].detach().cpu())
+                    rot_error += cur_rot_error if cur_rot_error < 50 else 50
+                    trans_error += cur_trans_error
+
+                rot_error /= len(cam_quat)
+                trans_error /= len(cam_quat)
 
                 lossR.backward()
                 optimizerE.step()
 
                 print('Name: ', opt.outf)
                 print('[%d/%d][%d/%d]\n'
-                'LossD: %.4f lossD_real: %.4f lossD_fake: %.4f lossD_gp: %.4f\n'
-                'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f '
-                'lossR_IC: %.4f \n'
+                'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f lossR_cam: %.4f, lossR_cam_quat: %.4f'
+                'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f \n'
                     % (epoch, opt.niter, iter, len(train_dataloader),
-                        lossD.item(), lossD_real.item(), lossD_fake.item(), lossD_gp.item(),
                         lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                        lossR_IC.item()
+                        lossR_cam.item(), lossR_cam_quat.item(), lossR_IC.item(), rot_error, trans_error
                         )
                 )
         schedulerD.step()
@@ -761,10 +834,6 @@ if __name__ == '__main__':
 
         if epoch % 1 == 0:
             summary_writer.add_scalar('Train/lr', schedulerE.get_last_lr()[0], epoch)
-            summary_writer.add_scalar('Train/lossD', lossD.item(), epoch)
-            summary_writer.add_scalar('Train/lossD_real', lossD_real.item(), epoch)
-            summary_writer.add_scalar('Train/lossD_fake', lossD_fake.item(), epoch)
-            summary_writer.add_scalar('Train/lossD_gp', lossD_gp.item(), epoch)
             summary_writer.add_scalar('Train/lossR', lossR.item(), epoch)
             summary_writer.add_scalar('Train/lossR_fake', lossR_fake.item(), epoch)
             summary_writer.add_scalar('Train/lossR_reg', lossR_reg.item(), epoch)
@@ -772,20 +841,22 @@ if __name__ == '__main__':
             summary_writer.add_scalar('Train/lossR_IC', lossR_IC.item(), epoch)
             summary_writer.add_scalar('Train/lossR_LC', lossR_LC.item(), epoch)
             summary_writer.add_scalar('Train/lossR_flip', lossR_flip.item(), epoch)
+            summary_writer.add_scalar('Train/lossR_cam', lossR_cam.item(), epoch)
+            summary_writer.add_scalar('Train/lossR_cam_quat', lossR_cam_quat.item(), epoch)
+            summary_writer.add_scalar('Train/rot_error', rot_error, epoch)
+            summary_writer.add_scalar('Train/trans_error', trans_error, epoch)
 
             num_images = Xa.shape[0]
             textures = Ae['textures']
 
             Xa = (Xa * 255).view(batch_size * num_views, C, H, W).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
             Xer = (Xer * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
-            Xir = (Xir * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
 
             Xa = torch.tensor(Xa, dtype=torch.float32) / 255.0
             Xa = Xa.permute(0, 3, 1, 2)
             Xer = torch.tensor(Xer, dtype=torch.float32) / 255.0
             Xer = Xer.permute(0, 3, 1, 2)
-            Xir = torch.tensor(Xir, dtype=torch.float32) / 255.0
-            Xir = Xir.permute(0, 3, 1, 2)
+
 
             randperm_a = torch.randperm(batch_size)
             randperm_b = torch.randperm(batch_size)
@@ -815,10 +886,6 @@ if __name__ == '__main__':
             vutils.save_image(Xer[:, :3].detach(),
                     '%s/current_Xer.png' % (opt.outf), normalize=True, nrow=num_views)
 
-            vutils.save_image(Xir[:, :3].detach(),
-                    '%s/epoch_%03d_Iter_%04d_Xir.png' % (opt.outf, epoch, iter), normalize=True)
-            vutils.save_image(Xir[:, :3].detach(),
-                    '%s/current_Xir.png' % (opt.outf), normalize=True)
 
             vutils.save_image(textures.detach(),
                     '%s/current_textures.png' % (opt.outf), normalize=True)
@@ -871,55 +938,55 @@ if __name__ == '__main__':
             }
             torch.save(state_dict, latest_name)
 
-        if epoch % 20 == 0 and epoch > 0:
-            netE.eval()
-            mask_ious = []
-            for i, data in tqdm.tqdm(enumerate(test_dataloader)):
-                Xa = Variable(data['data']['images']).cuda()
-                paths = data['data']['path']
+        # if epoch % 20 == 0 and epoch > 0:
+        #     netE.eval()
+        #     mask_ious = []
+        #     for i, data in tqdm.tqdm(enumerate(test_dataloader)):
+        #         Xa = Variable(data['data']['images']).cuda()
+        #         paths = data['data']['path']
 
-                with torch.no_grad():
-                    Ae = netE(Xa)
-                    Xer, Ae = diffRender.render(**Ae)
+        #         with torch.no_grad():
+        #             Ae = netE(Xa)
+        #             Xer, Ae = diffRender.render(**Ae)
 
-                    batch_size, num_views, C, H, W = Xa.shape
+        #             batch_size, num_views, C, H, W = Xa.shape
 
-                    # Get the first view for each object
-                    l = np.array(range(0, batch_size*num_views, num_views))
-                    Ai = deep_copy(Ae, index=l)
-                    Ai['azimuths'] = - torch.empty((Xa.shape[0]), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
-                    Xir, Ai = diffRender.render(**Ai)
+        #             # Get the first view for each object
+        #             l = np.array(range(0, batch_size*num_views, num_views))
+        #             Ai = deep_copy(Ae, index=l)
+        #             Ai['azimuths'] = - torch.empty((Xa.shape[0]), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
+        #             Xir, Ai = diffRender.render(**Ai)
 
-                    for i in range(len(paths)):
-                        path = paths[i][0] # only sample the first view for each multi-view input
-                        image_name = os.path.basename(path)
-                        rec_path = os.path.join(rec_dir, image_name)
-                        output_Xer = to_pil_image(Xer[i, :3].detach().cpu())
-                        output_Xer.save(rec_path, 'JPEG', quality=100)
+        #             for i in range(len(paths)):
+        #                 path = paths[i][0] # only sample the first view for each multi-view input
+        #                 image_name = os.path.basename(path)
+        #                 rec_path = os.path.join(rec_dir, image_name)
+        #                 output_Xer = to_pil_image(Xer[i, :3].detach().cpu())
+        #                 output_Xer.save(rec_path, 'JPEG', quality=100)
 
-                        inter_path = os.path.join(inter_dir, image_name)
-                        output_Xir = to_pil_image(Xir[i, :3].detach().cpu())
-                        output_Xir.save(inter_path, 'JPEG', quality=100)
+        #                 inter_path = os.path.join(inter_dir, image_name)
+        #                 output_Xir = to_pil_image(Xir[i, :3].detach().cpu())
+        #                 output_Xir.save(inter_path, 'JPEG', quality=100)
 
-                        ori_path = os.path.join(ori_dir, image_name)
-                        output_Xa = to_pil_image(Xa[i, 0, :3].detach().cpu())
-                        output_Xa.save(ori_path, 'JPEG', quality=100)
+        #                 ori_path = os.path.join(ori_dir, image_name)
+        #                 output_Xa = to_pil_image(Xa[i, 0, :3].detach().cpu())
+        #                 output_Xa.save(ori_path, 'JPEG', quality=100)
 
-                        gt_mask = Xa[i, 0, 3].detach().cpu()
-                        pred_mask = Xer[i * num_views, 3].detach().cpu()
-                        loss_mask = kal.metrics.render.mask_iou(pred_mask.unsqueeze(0), gt_mask.unsqueeze(0)).item()
+        #                 gt_mask = Xa[i, 0, 3].detach().cpu()
+        #                 pred_mask = Xer[i * num_views, 3].detach().cpu()
+        #                 loss_mask = kal.metrics.render.mask_iou(pred_mask.unsqueeze(0), gt_mask.unsqueeze(0)).item()
 
-                        mask_ious.append(1 - loss_mask)
+        #                 mask_ious.append(1 - loss_mask)
 
-            mask_iou = np.mean(mask_ious)
-            print('Test mask iou: %0.2f' % mask_iou)
-            summary_writer.add_scalar('Test/mask_iou', mask_iou, epoch)
+        #     mask_iou = np.mean(mask_ious)
+        #     print('Test mask iou: %0.2f' % mask_iou)
+        #     summary_writer.add_scalar('Test/mask_iou', mask_iou, epoch)
 
-            fid_recon = calculate_fid_given_paths([ori_dir, rec_dir], 32, True)
-            print('Test recon fid: %0.2f' % fid_recon)
-            summary_writer.add_scalar('Test/fid_recon', fid_recon, epoch)
+        #     fid_recon = calculate_fid_given_paths([ori_dir, rec_dir], 32, True)
+        #     print('Test recon fid: %0.2f' % fid_recon)
+        #     summary_writer.add_scalar('Test/fid_recon', fid_recon, epoch)
 
-            fid_inter = calculate_fid_given_paths([ori_dir, inter_dir], 32, True)
-            print('Test rotation fid: %0.2f' % fid_inter)
-            summary_writer.add_scalar('Test/fid_inter', fid_inter, epoch)
-            netE.train()
+        #     fid_inter = calculate_fid_given_paths([ori_dir, inter_dir], 32, True)
+        #     print('Test rotation fid: %0.2f' % fid_inter)
+        #     summary_writer.add_scalar('Test/fid_inter', fid_inter, epoch)
+        #     netE.train()
