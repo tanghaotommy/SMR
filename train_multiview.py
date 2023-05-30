@@ -35,7 +35,7 @@ from datasets.bird import Dataset as BirdDataset
 from datasets.co3d import Co3DDataset
 from datasets.co3d_seq import Co3DSeqDataset
 from datasets.shapenet import ShapeNetMultiView
-from geo_utils import mat2quat, get_relative_pose
+from geo_utils import get_cam_transform, get_relative_cam_transform, mat2quat, get_relative_pose, transform_relative_pose
 import geo_utils
 from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer, spherical_angles_from_camera_position
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder
@@ -767,7 +767,6 @@ if __name__ == '__main__':
                 cam_transform = generate_transformation_matrix(camera_pos, object_pos, camera_up)
                 c = torch.tensor([[0., 0., 0., 1.]], dtype=torch.float, device=device).repeat(batch_size * (num_views), 1).unsqueeze(2)
                 cam_transform = torch.cat([cam_transform, c], dim=2)
-                cam_transform = cam_transform.permute(0, 2, 1)
                 
                 # get relative gt camera pose
                 gt_cam = cam_transform.view(batch_size, num_views, 4, 4)
@@ -776,7 +775,7 @@ if __name__ == '__main__':
                 for c in gt_cam:
                     canonical = c[0, :, :]
                     gt_rel_poses = c[1:, :, :]
-                    c_r = get_relative_pose(canonical, gt_rel_poses)
+                    c_r = get_relative_cam_transform(canonical[None], gt_rel_poses)
                     gt_cam_rel.append(c_r)
 
                 gt_cam_rel = torch.stack(gt_cam_rel).view(batch_size * (num_views - 1), 4, 4).to(device)
@@ -789,11 +788,14 @@ if __name__ == '__main__':
 
                 # pred camera pose to spherical coordinate
                 camPoseRel_cv2 = geo_utils.quat2mat(poses_pred)              # [b*(t-1),4,4], relative cam pose in cv2 frame
-                camPoseAbsolute = canonical.unsqueeze(0) @ camPoseRel_cv2
+                r_c, t_c = canonical[:3, :3][None], canonical[3, :3][None]
+                canonical_cam_transform = get_cam_transform(r_c, t_c)
+                # pose relative to the canonical
+                new_cam_transform = transform_relative_pose(canonical_cam_transform, camPoseRel_cv2)
+                rot = new_cam_transform[:, :3, :3]
+                trans = new_cam_transform[:, 3, :3]
 
-                rot = camPoseAbsolute[:, :3, :3]
-                trans = camPoseAbsolute[:, :3, 3]
-                pred_camera_pos = (- trans.unsqueeze(1) @ rot).squeeze(1)
+                pred_camera_pos = - (rot @ trans.unsqueeze(2)).squeeze(2)
                 pred_cam_sphere = spherical_angles_from_camera_position(pred_camera_pos)
                 pred_cam_sphere = torch.stack(pred_cam_sphere, dim=1)
 

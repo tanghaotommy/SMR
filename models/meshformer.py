@@ -1012,11 +1012,11 @@ class MultiViewMeshFormer(nn.Module):
 
         # pred camera pose to spherical coordinate
         canonical = torch.FloatTensor([[ 1.0000,  0.0000,  0.0000,  0.0000],
-            [ 0.0000,  0.8660, -0.5000,  0.0000],
-            [ 0.0000,  0.5000,  0.8660, -3.0000],
-            [ 0.0000,  0.0000,  0.0000,  1.0000]]
+            [ 0.0000,  0.8660,  0.5000,  0.0000],
+            [ 0.0000, -0.5000,  0.8660,  0.0000],
+            [ 0.0000,  0.0000, -3.0000,  1.0000]]
         ).to(pred_cameras.device)
-        canonical_quat = torch.FloatTensor([ 0.9659,  0.2588,  0.0000,  0.0000,  0.0000,  0.0000, -3.0000]).to(pred_cameras.device)
+        canonical_quat = torch.FloatTensor([ 0.9659, -0.2588,  0.0000,  0.0000,  0.0000,  0.0000, -3.0000]).to(pred_cameras.device)
         tmp = torch.zeros_like(pred_cameras)
         tmp[:,:4] = F.normalize(pred_cameras[:,:4])
         tmp[:,4:] = pred_cameras[:,4:]
@@ -1027,11 +1027,14 @@ class MultiViewMeshFormer(nn.Module):
         pred_cam_quat = torch.cat([canonical_quat, pred_cam_quat], dim=1)
 
         camPoseRel_cv2 = geo_utils.quat2mat(poses_pred)              # [b*(t-1),4,4], relative cam pose in cv2 frame
-        camPoseAbsolute = canonical.unsqueeze(0) @ camPoseRel_cv2
+        r_c, t_c = canonical[:3, :3][None], canonical[3, :3][None]
 
-        rot = camPoseAbsolute[:, :3, :3]
-        trans = camPoseAbsolute[:, :3, 3]
-        pred_camera_pos = (- trans.unsqueeze(1) @ rot).squeeze(1)
+        canonical_cam_transform = geo_utils.get_cam_transform(r_c, t_c)
+        new_cam_transform = geo_utils.transform_relative_pose(canonical_cam_transform, camPoseRel_cv2)
+        rot = new_cam_transform[:, :3, :3]
+        trans = new_cam_transform[:, 3, :3]
+        
+        pred_camera_pos = - (rot @ trans.unsqueeze(2)).squeeze(2)
         pred_cam_sphere = spherical_angles_from_camera_position(pred_camera_pos)
         pred_cam_sphere = torch.stack(pred_cam_sphere, dim=1)
         canonical_sphere = torch.FloatTensor([0, 30, 3]).to(pred_cam_sphere.device).unsqueeze(0).repeat(batch_size, 1).unsqueeze(1)
