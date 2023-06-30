@@ -1,5 +1,6 @@
 import gzip
 import json
+import multiprocessing
 import os
 from transforms3d.euler import euler2mat
 import numpy as np
@@ -174,13 +175,62 @@ def normalize_views(ref_poses, ref_Ks, verts, images, masks, ref_size=128, margi
         np.stack(ref_imgs_new, 0), np.stack(ref_Ks_new,0), np.stack(ref_poses_new,0), np.stack(ref_Hs,0), np.stack(ref_masks_new,0)
 
     return ref_imgs_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_masks_new, scaled_verts
+    
+
+def process_one_scan(data):
+    scene_path, pose_dict = data
+    mask_dir = os.path.join(scene_path, "masks")
+    image_dir = os.path.join(scene_path, "images")
+    pointcloud_path = os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply")
+    frame_ids = [f.split(".jpg")[0] for f in os.listdir(os.path.join(co3d_raw_dir, image_dir))]
+    if not os.path.exists(pointcloud_path):
+        return
+    verts, _ = pytorch3d.io.load_ply(os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply"))
+
+    RTs = []
+    Ks = []
+    images, masks = [], []
+    for frame_id in frame_ids:
+        images.append(plt.imread(os.path.join(co3d_raw_dir, image_dir, f"{frame_id}.jpg")))
+        masks.append(plt.imread(os.path.join(co3d_raw_dir, mask_dir, f"{frame_id}.png")))
+        R, T, K = read_co3d_pose_from_dict(pose_dict, os.path.join(scene_path, "images", f"{frame_id}.jpg"))
+
+        # pytorch3d uses column vector, need to transpose R
+        RT = torch.cat([R.T, T.unsqueeze(1)], dim=1)
+        # convert from pytorch3d camera view coordinate to opencv
+        RT = torch.from_numpy(np.diag([-1,-1,1])).float() @ RT
+
+        RTs.append(RT)
+        Ks.append(K)
+
+    RTs = torch.stack(RTs).numpy()
+    Ks = torch.stack(Ks).numpy()
+    ref_imgs_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_masks_new, verts_new = normalize_views(
+        RTs, Ks, verts.numpy(), images, masks, 
+        ref_size=ref_size, margin=margin
+    )
+
+    output_dir = os.path.join(co3d_normalized_dir, scene_path)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "masks"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+    for i, frame_id in enumerate(frame_ids):
+        plt.imsave(os.path.join(output_dir, "masks", f"{frame_id}.png"), ref_masks_new[i])
+        plt.imsave(os.path.join(output_dir, "images", f"{frame_id}.jpg"), ref_imgs_new[i])
+    
+    pytorch3d.io.save_ply(os.path.join(co3d_normalized_dir, scene_path, "pointcloud.ply"), torch.from_numpy(verts_new))
+    with open(os.path.join(output_dir, "meta_info.pkl"), 'wb') as f:
+        pickle.dump([ref_Ks_new, ref_poses_new], f)
+
+    print(f"processed {scene_path}")
+
+ref_size = 128
+margin = 0.05
+co3d_raw_dir = "/datasets01/co3d/081922"
+co3d_normalized_dir = "/checkpoint/haotang/data/co3d_normalized"
+categories = ["cup", "laptop", "mouse", "bottle", "cake", "bowl", "vase", "book", "remote", "tv"]
 
 def main():
-    ref_size = 128
-    margin = 0.05
-    co3d_raw_dir = "/datasets01/co3d/081922"
-    co3d_normalized_dir = "/checkpoint/haotang/data/co3d_normalized"
-    categories = ["toyplane"]
     pose_dict = {}
     scene_paths = []
 
@@ -201,50 +251,57 @@ def main():
 
         scene_paths.extend([os.path.join(cat, scene_id) for scene_id in valid_scene_ids])
 
-    # Process per scan
-    for scene_path in tqdm(scene_paths, total=len(scene_paths)):
-        mask_dir = os.path.join(scene_path, "masks")
-        image_dir = os.path.join(scene_path, "images")
-        pointcloud_path = os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply")
-        frame_ids = [f.split(".jpg")[0] for f in os.listdir(os.path.join(co3d_raw_dir, image_dir))]
-        if not os.path.exists(pointcloud_path):
-            continue
-        verts, _ = pytorch3d.io.load_ply(os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply"))
+    data = [[scene_path, pose_dict] for scene_path in scene_paths]
+    num_processes = 8
+    pool = multiprocessing.Pool(num_processes)
+    pool.map(process_one_scan, data)
 
-        RTs = []
-        Ks = []
-        images, masks = [], []
-        for frame_id in frame_ids:
-            images.append(plt.imread(os.path.join(co3d_raw_dir, image_dir, f"{frame_id}.jpg")))
-            masks.append(plt.imread(os.path.join(co3d_raw_dir, mask_dir, f"{frame_id}.png")))
-            R, T, K = read_co3d_pose_from_dict(pose_dict, os.path.join(scene_path, "images", f"{frame_id}.jpg"))
+    pool.close()
+    pool.join()
+    # # Process per scan
+    # for scene_path in tqdm(scene_paths, total=len(scene_paths)):
+    #     mask_dir = os.path.join(scene_path, "masks")
+    #     image_dir = os.path.join(scene_path, "images")
+    #     pointcloud_path = os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply")
+    #     frame_ids = [f.split(".jpg")[0] for f in os.listdir(os.path.join(co3d_raw_dir, image_dir))]
+    #     if not os.path.exists(pointcloud_path):
+    #         continue
+    #     verts, _ = pytorch3d.io.load_ply(os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply"))
 
-            # pytorch3d uses column vector, need to transpose R
-            RT = torch.cat([R.T, T.unsqueeze(1)], dim=1)
-            # convert from pytorch3d camera view coordinate to opencv
-            RT = torch.from_numpy(np.diag([-1,-1,1])).float() @ RT
+    #     RTs = []
+    #     Ks = []
+    #     images, masks = [], []
+    #     for frame_id in frame_ids:
+    #         images.append(plt.imread(os.path.join(co3d_raw_dir, image_dir, f"{frame_id}.jpg")))
+    #         masks.append(plt.imread(os.path.join(co3d_raw_dir, mask_dir, f"{frame_id}.png")))
+    #         R, T, K = read_co3d_pose_from_dict(pose_dict, os.path.join(scene_path, "images", f"{frame_id}.jpg"))
 
-            RTs.append(RT)
-            Ks.append(K)
+    #         # pytorch3d uses column vector, need to transpose R
+    #         RT = torch.cat([R.T, T.unsqueeze(1)], dim=1)
+    #         # convert from pytorch3d camera view coordinate to opencv
+    #         RT = torch.from_numpy(np.diag([-1,-1,1])).float() @ RT
 
-        RTs = torch.stack(RTs).numpy()
-        Ks = torch.stack(Ks).numpy()
-        ref_imgs_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_masks_new, verts_new = normalize_views(
-            RTs, Ks, verts.numpy(), images, masks, 
-            ref_size=ref_size, margin=margin
-        )
+    #         RTs.append(RT)
+    #         Ks.append(K)
 
-        output_dir = os.path.join(co3d_normalized_dir, scene_path)
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "masks"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
-        for i, frame_id in enumerate(frame_ids):
-            plt.imsave(os.path.join(output_dir, "masks", f"{frame_id}.png"), ref_masks_new[i])
-            plt.imsave(os.path.join(output_dir, "images", f"{frame_id}.jpg"), ref_imgs_new[i])
+    #     RTs = torch.stack(RTs).numpy()
+    #     Ks = torch.stack(Ks).numpy()
+    #     ref_imgs_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_masks_new, verts_new = normalize_views(
+    #         RTs, Ks, verts.numpy(), images, masks, 
+    #         ref_size=ref_size, margin=margin
+    #     )
+
+    #     output_dir = os.path.join(co3d_normalized_dir, scene_path)
+    #     os.makedirs(output_dir, exist_ok=True)
+    #     os.makedirs(os.path.join(output_dir, "masks"), exist_ok=True)
+    #     os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+    #     for i, frame_id in enumerate(frame_ids):
+    #         plt.imsave(os.path.join(output_dir, "masks", f"{frame_id}.png"), ref_masks_new[i])
+    #         plt.imsave(os.path.join(output_dir, "images", f"{frame_id}.jpg"), ref_imgs_new[i])
         
-        pytorch3d.io.save_ply(os.path.join(co3d_normalized_dir, scene_path, "pointcloud.ply"), torch.from_numpy(verts_new))
-        with open(os.path.join(output_dir, "meta_info.pkl"), 'wb') as f:
-            pickle.dump([ref_Ks_new, ref_poses_new], f)
+    #     pytorch3d.io.save_ply(os.path.join(co3d_normalized_dir, scene_path, "pointcloud.ply"), torch.from_numpy(verts_new))
+    #     with open(os.path.join(output_dir, "meta_info.pkl"), 'wb') as f:
+    #         pickle.dump([ref_Ks_new, ref_poses_new], f)
                 
 
 if __name__ == "__main__":

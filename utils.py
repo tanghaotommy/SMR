@@ -128,6 +128,19 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
     return gradient_penalty
 
 
+def pytorch3d_to_kaolin(R, T):
+    """
+    Convert R and T from PyTorch3D convention to Kaolin convention
+    """
+    R_cvt = torch.FloatTensor([
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, 0, -1]
+    ]).to(R.device)
+    T_cvt = torch.FloatTensor([-1, 1, -1])
+    
+    return R @ R_cvt, T * T_cvt
+
 # def calc_fid():
 #     for i, data in tqdm.tqdm(enumerate(test_dataloader)):
 #         Xa = Variable(data['data']['images']).cuda()

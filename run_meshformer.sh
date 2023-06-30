@@ -7,7 +7,7 @@
 # LICENSE file in the root directory of this source tree
 
 
-#SBATCH --job-name=SMR
+#SBATCH --job-name=SMR_multi_category
 
 #SBATCH --output=/checkpoint/haotang/slurm_logs/SMR/%x_%j.out
 
@@ -47,25 +47,27 @@ export CUDA_HOME=/public/apps/cuda/11.3/
 
 cd /checkpoint/haotang/dev/SMR/
 
+export DATA_ROOT=/checkpoint/haotang/data/co3d_normalized
 # export DATA_ROOT=/datasets01/co3d/081922
-export DATA_ROOT=/checkpoint/haotang/data/shapenet_multiview_10
+# export DATA_ROOT=/checkpoint/haotang/data/shapenet_multiview_10
 # export DATA_ROOT=/checkpoint/haotang/data/CUB_Data
 export CUDA_LAUNCH_BLOCKING=1.
-srun  python train_multiview.py --imageSize 128 \
-                    --batchSize 24 \
+srun  python train_multiview.py --batchSize 24 \
+                    --batchSize 32 \
                     --lr 0.0001 \
-                    --niter 500 \
-                    --dataset shapenet \
+                    --niter 9000 \
+                    --dataset co3d_seq \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/MultiViewFormer/shapenet_airplane_multiviewmeshformer_cam_transform\
+                    --outf ./log/MultiViewFormer/normalized_co3d_toyplane_and_teddybear_9000_iters_rgb_recenter_masked_image_loss_reg01 \
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \
                     --lambda_gan 0.0001 \
-                    --lambda_reg 1.0 \
+                    --lambda_reg 0.1 \
                     --lambda_data 1.0 \
                     --lambda_ic 0.1 \
                     --lambda_lc 0.001 \
+                    --visualization_epoch 10 \
                     --model MeshFormer
                     # --amodal 2

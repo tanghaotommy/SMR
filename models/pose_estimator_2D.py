@@ -146,7 +146,7 @@ class PoseEstimator2DFeat(nn.Module):
             nn.Linear(256, 7)
         ])
 
-        pos_emb = 0.05 * torch.from_numpy(model_utils.get_2d_sincos_pos_embed(256, 8, cls_token=False)).float()
+        pos_emb = 0.05 * torch.from_numpy(model_utils.get_2d_sincos_pos_embed(256, [8, 8], cls_token=False)).float()
         self.pos_emb = nn.Parameter(pos_emb.unsqueeze(0))
 
 

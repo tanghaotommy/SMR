@@ -756,7 +756,7 @@ class MeshFormer(nn.Module):
 class MultiViewMeshFormer(nn.Module):
     """This is the base class for Transformer based mesh reconstruction"""
 
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False):
         """Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -767,8 +767,9 @@ class MultiViewMeshFormer(nn.Module):
         super().__init__()
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
+        self.load_pretrained = load_pretrained
 
-        self.backbone = build_backbone("resnet18")
+        self.backbone = build_backbone("resnet18", load_pretrained=load_pretrained)
         # self.transformer = build_transformer(nheads=4, enc_layers=2, dec_layers=2)
         hidden_dim = 256
         pre_norm = False
@@ -939,8 +940,11 @@ class MultiViewMeshFormer(nn.Module):
         mask_vec = mask.flatten(1)  # BxHW
         return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
 
-    def forward(self, x, gt_poses):
+    def forward(self, x, gt_poses, use_gt_pose=True):
         device = x.device
+        # pretrained assume we only have RGB, no mask as 4th channel
+        if self.load_pretrained:
+            x = x[:, :, :3, :, :]
         batch_size, num_views, C, H, W = x.shape
         img = x
 
@@ -1004,11 +1008,13 @@ class MultiViewMeshFormer(nn.Module):
         # canonical = torch.FloatTensor([0, 30, 3]).to(gt_poses.device)
         # gt_poses[:, 0] = canonical
         # gt_poses[:, 1:] = gt_poses[:, 1:] + canonical
-        cameras = gt_poses.view(batch_size * num_views, -1)
-        cameras = [cameras[:, 0], cameras[:, 1], cameras[:, 2]]
+        # cameras = gt_poses.view(batch_size * num_views, -1)
+        # cameras = [cameras[:, 0], cameras[:, 1], cameras[:, 2]]
 
         # pred_cameras = self.pose_estimator(img[:, :, :3, :, :])
-        pred_cameras = self.pose_estimator(output["feat"].permute(1, 2, 0).contiguous().view(batch_size, num_views, dim, 8, 8))
+        feat_H = H // 16
+        feat_W = W // 16
+        pred_cameras = self.pose_estimator(output["feat"].permute(1, 2, 0).contiguous().view(batch_size, num_views, dim, feat_H, feat_W))
 
         # pred camera pose to spherical coordinate
         canonical = torch.FloatTensor([[ 1.0000,  0.0000,  0.0000,  0.0000],
@@ -1016,7 +1022,8 @@ class MultiViewMeshFormer(nn.Module):
             [ 0.0000, -0.5000,  0.8660,  0.0000],
             [ 0.0000,  0.0000, -3.0000,  1.0000]]
         ).to(pred_cameras.device)
-        canonical_quat = torch.FloatTensor([ 0.9659, -0.2588,  0.0000,  0.0000,  0.0000,  0.0000, -3.0000]).to(pred_cameras.device)
+        # canonical_quat = torch.FloatTensor([ 0.9659, -0.2588,  0.0000,  0.0000,  0.0000,  0.0000, -3.0000]).to(pred_cameras.device)
+        canonical_quat = torch.FloatTensor([ 1.0000, 0.0000,  0.0000,  0.0000,  0.0000,  0.0000, 0.0000]).to(pred_cameras.device)
         tmp = torch.zeros_like(pred_cameras)
         tmp[:,:4] = F.normalize(pred_cameras[:,:4])
         tmp[:,4:] = pred_cameras[:,4:]
@@ -1024,27 +1031,15 @@ class MultiViewMeshFormer(nn.Module):
 
         pred_cam_quat = poses_pred.view(batch_size, num_views - 1, -1)
         canonical_quat = canonical_quat.unsqueeze(0).repeat(batch_size, 1).unsqueeze(1)
-        pred_cam_quat = torch.cat([canonical_quat, pred_cam_quat], dim=1)
 
-        camPoseRel_cv2 = geo_utils.quat2mat(poses_pred)              # [b*(t-1),4,4], relative cam pose in cv2 frame
-        r_c, t_c = canonical[:3, :3][None], canonical[3, :3][None]
-
-        canonical_cam_transform = geo_utils.get_cam_transform(r_c, t_c)
-        new_cam_transform = geo_utils.transform_relative_pose(canonical_cam_transform, camPoseRel_cv2)
-        rot = new_cam_transform[:, :3, :3]
-        trans = new_cam_transform[:, 3, :3]
-        
-        pred_camera_pos = - (rot @ trans.unsqueeze(2)).squeeze(2)
-        pred_cam_sphere = spherical_angles_from_camera_position(pred_camera_pos)
-        pred_cam_sphere = torch.stack(pred_cam_sphere, dim=1)
-        canonical_sphere = torch.FloatTensor([0, 30, 3]).to(pred_cam_sphere.device).unsqueeze(0).repeat(batch_size, 1).unsqueeze(1)
-        pred_cam_sphere = pred_cam_sphere.view(batch_size, num_views - 1, -1)
-        pred_cam_sphere = torch.cat([canonical_sphere, pred_cam_sphere], dim=1)
-
+        if use_gt_pose:
+            pred_cam_quat = torch.cat([canonical_quat, gt_poses], dim=1)
+        else:
+            pred_cam_quat = torch.cat([canonical_quat, pred_cam_quat], dim=1)
 
         # shape fuse and prediction
         # camera_pos_embed = self.camera_pos_embeding(gt_poses.view(batch_size * num_views, -1).unsqueeze(0))[0].view(batch_size, num_views, -1)
-        shape_feat = torch.cat([shape_feat, pred_cam_quat.view(num_views*batch_size, -1).unsqueeze(0).repeat(64, 1, 1)], dim=2)
+        shape_feat = torch.cat([shape_feat, pred_cam_quat.view(num_views*batch_size, -1).unsqueeze(0).repeat(feat_H * feat_W, 1, 1)], dim=2)
         shape_pos_embed = pos_embed
         HW, _, dim = shape_feat.shape
         tgt = shape_feat.permute(1, 2, 0).contiguous()
@@ -1068,20 +1063,20 @@ class MultiViewMeshFormer(nn.Module):
         # repeat shape prediction for every item
         delta_vertices = delta_vertices.repeat_interleave(num_views, dim=0)
 
-        return delta_vertices, cameras, lights, textures, pred_cameras, [pred_cam_sphere.view(num_views*batch_size, -1)[:, 0], pred_cam_sphere.view(num_views*batch_size, -1)[:, 1], pred_cam_sphere.view(num_views*batch_size, -1)[:, 2]]
+        return delta_vertices, _, lights, textures, pred_cameras, shape_memory.view(num_views, 8, 8, batch_size, dim).permute(3, 0, 4, 1, 2)[:, :, :256, :, :]
 
 
-def build_backbone(backbone_type="resnet50", train_backbone=True):
+def build_backbone(backbone_type="resnet50", train_backbone=True, load_pretrained=False):
     position_embedding = build_position_encoding()
     backbone = Backbone(
         backbone_type,
         train_backbone,
         False,
         False,
-        False, # since the input channel is 4 instead of 3, we need to train the entire network
+        load_pretrained, # since the input channel is 4 instead of 3, we need to train the entire network
         None,
-        pretrained=False,
-        input_dim=4
+        pretrained=load_pretrained,
+        input_dim=3 if load_pretrained else 4
     )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels

@@ -382,6 +382,111 @@ class TextureEncoder(nn.Module):
         return textures
 
 
+class MultiViewTextureEncoder(nn.Module):
+    def __init__(self, nc, nf, nk, num_vertices):
+        super(MultiViewTextureEncoder, self).__init__()
+        self.num_vertices = num_vertices
+
+        block1 = self.convblock(nc, nf//2, nk, stride=2, pad=2)
+        block2 = self.convblock(nf//2, nf, nk, stride=2, pad=2)
+        block3 = self.convblock(nf, nf * 2, nk, stride=2, pad=2)
+        block4 = self.convblock(nf * 2, nf * 4, nk, stride=2, pad=2)
+        block5 = self.convblock(nf * 4, nf * 8, nk, stride=2, pad=2)
+
+        avgpool = [nn.AdaptiveAvgPool2d(1)]
+
+        linear1 = self.convblock(nf * 8, nf * 16, 1, stride=1, pad=0)
+        linear2 = self.convblock(nf * 16, nf * 8, 1, stride=1, pad=0)
+
+        #################################################
+        all_blocks = block1 + block2 + block3 + block4 + block5 + avgpool
+        self.encoder1 = nn.Sequential(*all_blocks)
+
+        all_blocks = linear1 + linear2
+        self.encoder2 = nn.Sequential(*all_blocks)
+
+        # Initialize with Xavier Glorot
+        for m in self.modules():
+            if isinstance(m, nn.ConvTranspose2d) \
+            or isinstance(m, nn.Linear) \
+            or isinstance(object, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.normal_(m.weight, mean=0, std=0.001)
+
+        # Free some memory
+        del all_blocks, block1, block2, block3, block4, block5, linear1, linear2
+
+        self.texture_flow = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.Upsample(scale_factor=4),
+            nn.Conv2d(nf * 8, nf * 8, 3, 1, 1),
+            nn.BatchNorm2d(nf * 8),
+            nn.ReLU(True),
+
+            # state size. (nf*8) x 8 x 8
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf * 8, nf * 8, 3, 1, 1, padding_mode='reflect'),
+            nn.BatchNorm2d(nf * 8),
+            nn.ReLU(True),
+            # state size. (nf*4) x 16 x 16
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf * 8, nf * 4, 3, 1, 1, padding_mode='reflect'),
+            nn.BatchNorm2d(nf * 4),
+            nn.ReLU(True),
+            # state size. (nf*2) x 32 x 32
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf * 4, nf * 2, 3, 1, 1, padding_mode='reflect'),
+            nn.BatchNorm2d(nf * 2),
+            nn.ReLU(True),
+            # state size. (nf) x 64 x 64
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf * 2, nf * 2, 3, 1, 1, padding_mode='reflect'),
+            nn.BatchNorm2d(nf * 2),
+            nn.ReLU(True),
+            # state size. (nf) x 128 x 128
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf * 2, nf, 3, 1, 1, padding_mode='reflect'),
+            nn.BatchNorm2d(nf),
+            nn.ReLU(True),
+            # state size. (nf) x 256 x 256
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(nf, 3, 3, 1, 1, padding_mode='reflect'),
+            # nn.BatchNorm2d(nf),
+            # nn.ReLU(True),
+            #
+            # nn.Conv2d(nf, 2, 5, 1, 2, padding_mode='reflect'),
+            nn.Tanh()
+        )
+
+    def convblock(self, indim, outdim, ker, stride, pad):
+        block2 = [
+            nn.Conv2d(indim, outdim, ker, stride, pad),
+            nn.BatchNorm2d(outdim),
+            nn.ReLU()
+        ]
+        return block2
+
+    def linearblock(self, indim, outdim):
+        block2 = [
+            nn.Linear(indim, outdim),
+            nn.BatchNorm1d(outdim),
+            nn.ReLU()
+        ]
+        return block2
+
+    def forward(self, x, feat):
+        img = x[:, :, :3]
+
+        feat = nn.AdaptiveAvgPool1d(1)(nn.AdaptiveAvgPool2d(1)(feat).squeeze(-1).squeeze(-1).permute(0, 2, 1)).unsqueeze(-1)
+        feat = self.encoder2(feat)
+        uv_sampler = self.texture_flow(feat).permute(0, 2, 3, 1)
+        textures = F.grid_sample(img.permute(0, 2, 1, 3, 4), uv_sampler.unsqueeze(1)).squeeze(2)
+
+        # textures_flip = textures.flip([2])
+        # textures = torch.cat([textures, textures_flip], dim=2)
+        return textures
+
+
 # class FeatEncoder(nn.Module):
 #     """
 #     output 3 levels of features using a FPN structure
