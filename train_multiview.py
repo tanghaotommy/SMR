@@ -99,15 +99,17 @@ elif opt.dataset == "co3d":
 #     train_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
 #     test_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
 elif opt.dataset == "co3d_seq":
-    train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane", "teddybear"])
-    test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane", "teddybear"])
+    # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train_frame_split", categories=["toyplane"], sample_mode="near20")
+    # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val_frame_split", categories=["toyplane"], sample_mode="near20")
+    train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane"])
+    test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane"])
     # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane", "teddybear", "bottle", "bowl", 
     #                                                                             "cup", "laptop", "mouse", "remote"])
     # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane", "teddybear", "bottle", "bowl", 
     #                                                                             "cup", "laptop", "mouse", "remote"])
 elif opt.dataset == "shapenet":
-    train_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"])
-    test_dataset = ShapeNetMultiView(opt.dataroot, category_ids=["02691156"])
+    train_dataset = ShapeNetMultiView(opt.dataroot, "train", category_ids=["02691156"])
+    test_dataset = ShapeNetMultiView(opt.dataroot, "val", category_ids=["02691156"])
     test_dataset.object_path = test_dataset.object_path[:10]
 else:
     raise NotImplementedError
@@ -872,14 +874,20 @@ if __name__ == '__main__':
                 lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
                 # lossR = lossR_cam_quat
                 rot_error, trans_error = 0.0, 0.0
+                rot_all = 0.0
+                canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
                 for img_idx in range(len(cam_quat_gt)):
                     cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
                                                                          cam_quat_gt[img_idx].detach().cpu())
+                    cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
+                                                    canonical.detach().cpu())
+                    rot_all += cur_rot
                     rot_error += cur_rot_error if cur_rot_error < 50 else 50
                     trans_error += cur_trans_error
 
                 rot_error /= len(cam_quat_gt)
                 trans_error /= len(cam_quat_gt)
+                rot_all /= len(cam_quat_gt)
 
                 lossR.backward()
                 optimizerE.step()
@@ -887,10 +895,10 @@ if __name__ == '__main__':
                 print('Name: ', opt.outf)
                 print('[%d/%d][%d/%d]\n'
                 'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
-                'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f \n'
+                'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f rot_all: %.4f \n'
                     % (epoch, opt.niter, iter, len(train_dataloader),
                         lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                        loss_pose.item(), loss_trans.item(), lossR_IC.item(), rot_error, trans_error
+                        loss_pose.item(), loss_trans.item(), lossR_IC.item(), rot_error, trans_error, rot_all
                         )
                 )
 
@@ -916,6 +924,7 @@ if __name__ == '__main__':
             summary_writer.add_scalar('Train/loss_pose', np.average(loss_pose_all), epoch)
             summary_writer.add_scalar('Train/loss_trans', np.average(loss_trans_all), epoch)
             summary_writer.add_scalar('Train/rot_error', np.average(rot_error_all), epoch)
+            summary_writer.add_scalar('Train/rot_all', np.average(rot_all), epoch)
             summary_writer.add_scalar('Train/trans_error', np.average(trans_error_all), epoch)
 
             # summary_writer.add_scalar('Train/lossR', lossR.item(), epoch)
@@ -1121,6 +1130,7 @@ if __name__ == '__main__':
             summary_writer.add_scalar('Val/loss_trans', np.average(loss_trans_all), epoch)
             summary_writer.add_scalar('Val/rot_error', np.average(rot_error_all), epoch)
             summary_writer.add_scalar('Val/trans_error', np.average(trans_error_all), epoch)
+            netE.train()
 
 
         #         Xa = Variable(data['data']['images']).cuda()

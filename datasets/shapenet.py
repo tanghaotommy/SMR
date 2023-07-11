@@ -6,19 +6,33 @@ import torchvision
 import numpy as np
 from PIL import Image
 import os
+from geo_utils import get_cam_transform, get_relative_cam_transform, mat2quat, transform_relative_pose
+
+from utils import camera_position_from_spherical_angles, generate_transformation_matrix
+import pytorch3d
 
 
 class ShapeNetMultiView(Dataset):
-    def __init__(self, data_path, category_ids=["02691156"], num_views=5, image_size=128):
+    def __init__(self, data_path, mode, category_ids=["02691156"], num_views=5, image_size=128):
         self.data_path = data_path
         self.num_views = num_views
         self.image_size = image_size
         self.object_dict = {}
         self.object_path = []
+        self.mode = mode
         for cat_id in category_ids:
             self.load_one_category(cat_id)
 
-        # n_data = 10
+
+        split_ratio = 0.8
+        split_ind = int(len(self.object_path) * split_ratio)
+        if self.mode == "train":
+            self.object_path = self.object_path[:split_ind]
+            # self.scene_paths = self.scene_paths[:50] * (len(self.scene_paths) // 50)
+        elif self.mode == "val":
+            # self.scene_paths = self.scene_paths[:split_ind]
+            self.object_path = self.object_path[split_ind:]
+        # n_data = 4
         # self.object_path = self.object_path[:n_data]
 
     def load_one_category(self, category_id):
@@ -60,9 +74,43 @@ class ShapeNetMultiView(Dataset):
         original_rgbs = torch.stack([d[1] for d in preprocessed_data], dim=0).squeeze(0)
         edge = torch.stack([d[2] for d in preprocessed_data], dim=0).squeeze(0)
         path = [f"{a.split('/')[-1]}" for a in img_paths]
-        poses = [[int(p.split(".")[0]), 30, 3] for p in path]   # azimuths, elevations, distances
-        poses = torch.FloatTensor(poses)
-        poses[:, 0] = (((poses[:, 0] + 180) - poses[0, 0]) % 360) - 180
+        cam_pos = [[int(p.split(".")[0]), 30, 3] for p in path]   # azimuths, elevations, distances
+        cam_pos = torch.FloatTensor(cam_pos)
+        cam_pos[:, 0] = (((cam_pos[:, 0] + 180) - cam_pos[0, 0]) % 360) - 180
+
+        # Convert this into R, T and relative poses, in Kaolin
+        distances = cam_pos[:, 2]
+        elevations = cam_pos[:, 1]
+        azimuths = cam_pos[:, 0]
+        num_sample = len(distances)
+
+        object_pos = torch.tensor([[0., 0., 0.]], dtype=torch.float).repeat(num_sample, 1)
+        camera_up = torch.tensor([[0., 1., 0.]], dtype=torch.float).repeat(num_sample, 1)
+        # camera_pos = torch.tensor([[0., 0., 4.]], dtype=torch.float, device=device).repeat(batch_size, 1)
+        camera_pos = camera_position_from_spherical_angles(distances, elevations, azimuths, degrees=True)
+        cam_transform = generate_transformation_matrix(camera_pos, object_pos, camera_up)
+        
+        R = cam_transform[:, :3, :3]
+        T = cam_transform[:, 3, :3]
+        cam_transform = get_cam_transform(R, T)
+        relative_poses = get_relative_cam_transform(cam_transform[:1], cam_transform[1:])
+        
+
+        # TODO: make the first frame pose identity
+        identity = torch.eye(4)[None]
+        absolute_poses = torch.cat([
+            identity, 
+            transform_relative_pose(identity, relative_poses)
+        ], dim=0)
+        rel_origin_transform_pytorch3d = get_relative_cam_transform(identity, cam_transform[:1])[0]
+        center = torch.zeros([3]).unsqueeze(0)
+        center = pytorch3d.transforms.transform3d.Transform3d(
+            matrix=rel_origin_transform_pytorch3d
+        ).transform_points(center)[0]
+
+        cam_quat = mat2quat(relative_poses)
+        focal_length = torch.FloatTensor([[2.5, 2.5]]).repeat(num_sample, 1)
+
         if len(path) == 1:
             path = path[0]
         
@@ -72,7 +120,12 @@ class ShapeNetMultiView(Dataset):
             "edge": edge,
             "path": path,
             "label": "unavailable",
-            "poses": poses,
+            "poses": cam_pos,
+            "center": center,
+            "absolute_poses": absolute_poses,
+            "relative_poses": relative_poses,
+            "relative_poses_quat": cam_quat,
+            "focal_length": focal_length, 
         }
         return {"data": data}
 
