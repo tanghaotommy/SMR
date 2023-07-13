@@ -27,10 +27,11 @@ import pickle
 
 
 class Co3DSeqNormalizedDataset(Dataset):
-    def __init__(self, root, mode, num_views=5, categories=["toyplane"]):
+    def __init__(self, root, mode, num_views=5, categories=["toyplane"], sample_mode="random"):
         self.root = root
         self.num_views = num_views
         self.mode = mode
+        self.sample_mode = sample_mode
         self.scene_paths = []
         for cat in categories:
             scene_ids = os.listdir(os.path.join(root, cat))
@@ -56,6 +57,8 @@ class Co3DSeqNormalizedDataset(Dataset):
         return len(self.scene_paths)
 
     def preprocess_co3d(self, img, m):
+        transform = torchvision.transforms.RandomAffine(5, translate=(0.02, 0.02))
+
         m = (m[..., None] > 0.4)
         ones = (np.ones(img.shape) * 255).astype(np.uint8)
         t_rgb = img * m + ones * (1 - m)
@@ -68,6 +71,10 @@ class Co3DSeqNormalizedDataset(Dataset):
         
         rgb = torch.cat([t_rgb, t_s], dim=-1).permute(2, 0, 1)
         original_rgb = torch.cat([torch.from_numpy(img) / 255.0, t_s], dim=-1).permute(2, 0, 1)
+
+        # if self.mode[:5] == "train":
+        #     transformed_joint = transform(torch.cat([rgb, original_rgb], dim=0))
+        #     rgb, original_rgb = transformed_joint[:4], transformed_joint[4:]
 
         return rgb, original_rgb
     
@@ -91,19 +98,54 @@ class Co3DSeqNormalizedDataset(Dataset):
 
         frame_ids = [f.split(".jpg")[0] for f in os.listdir(image_dir)]
 
+        # train val split based on frame
+        split_ratio = 0.8
+        split_ind = int(len(frame_ids) * split_ratio)
+        if self.mode == "train_frame_split":
+            frame_list_indicis = list(range(len(frame_ids)))
+            val_frame_list_indicis = set(frame_list_indicis[split_ind:])
+            # val_frame_list_indicis = set(frame_list_indicis[::5])
+            # val_frame_list_indicis = set(frame_list_indicis[int(len(frame_ids) * 0.4):int(len(frame_ids) * 0.6)])
+
+            train_frame_list_indicis = [f_id for f_id in frame_list_indicis if f_id not in val_frame_list_indicis]
+            frame_ids = [frame_ids[f_id] for f_id in train_frame_list_indicis]
+            Rs = Rs[train_frame_list_indicis]
+            Ts = Ts[train_frame_list_indicis]
+
+            if self.sample_mode == "near20":
+                start_idx = np.random.randint(0, int(0.8 * len(frame_ids)))
+                end_idx = start_idx + int(0.2 * len(frame_ids))
+                frame_ids = frame_ids[start_idx:end_idx]
+                Rs = Rs[start_idx:end_idx]
+                Ts = Ts[start_idx:end_idx]
+
+        elif self.mode == "val_frame_split":
+            frame_list_indicis = list(range(len(frame_ids)))
+            # val_frame_list_indicis = frame_list_indicis[::5]
+            val_frame_list_indicis = frame_list_indicis[split_ind:]
+            # val_frame_list_indicis = frame_list_indicis[int(len(frame_ids) * 0.4):int(len(frame_ids) * 0.6)]
+
+            frame_ids = [frame_ids[f_id] for f_id in val_frame_list_indicis]
+            Rs = Rs[val_frame_list_indicis]
+            Ts = Ts[val_frame_list_indicis]
+
+
         # no predefined sampled ids
+        max_retry = 5
         sampled_frame_ids = self.sampled_frame_ids
         if sampled_frame_ids is None:
             sampled_frame_ids = []
 
             for i in range(self.num_views):
                 valid = False
-                while not valid:
+                n_try = 0
+                while not valid and n_try < max_retry:
                     sampled_id = np.random.randint(0, len(frame_ids))
                     mask = plt.imread(os.path.join(mask_dir, f"{frame_ids[sampled_id]}.png"))
                     mask = (mask[..., 0]) > 0.5
                     if np.sum(mask) != 0:
                         valid = True
+                    n_try += 1
 
                 sampled_frame_ids.append(sampled_id)
 
