@@ -83,13 +83,13 @@ parser.add_argument('--ddp', action='store_true', default=False, help='whether u
 parser.add_argument('--n_gpu_per_node', type=int, default=2, help='number of GPUs per node')
 
 opt = parser.parse_args()
-# print(opt)
+print(opt)
 
-# if opt.manualSeed is None:
-#     opt.manualSeed = random.randint(1, 10000)
-# # print("Random Seed: ", opt.manualSeed)
-# random.seed(opt.manualSeed)
-# torch.manual_seed(opt.manualSeed)
+if opt.manualSeed is None:
+    opt.manualSeed = random.randint(1, 10000)
+# print("Random Seed: ", opt.manualSeed)
+random.seed(opt.manualSeed)
+torch.manual_seed(opt.manualSeed)
 
 TRAINING_CATEGORIES = [
     "apple",
