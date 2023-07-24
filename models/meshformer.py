@@ -99,6 +99,69 @@ class CameraDecoder(nn.Module):
 
         cameras = [azimuths, elevations, distances]
         return cameras
+    
+
+class PoseDecoder(nn.Module):
+    def __init__(self, transformer_hidden_dim, decoder):
+        super(PoseDecoder, self).__init__()
+
+        self.camera_query_embedding = nn.Embedding(1, transformer_hidden_dim)
+        self.transformer_hidden_dim = transformer_hidden_dim
+        self.proj_pose = nn.Linear(7, transformer_hidden_dim)
+        self.decoder = decoder
+        linear1 = self.linearblock(transformer_hidden_dim, 1024)
+        linear2 = self.linearblock(1024, 1024)
+        all_blocks = linear1 + linear2
+        self.encoder2 = nn.Sequential(*all_blocks)
+        self.linear = nn.Sequential(*[
+            nn.Linear(transformer_hidden_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(),
+            nn.Linear(256, 7)
+        ])
+        self.batch_norm = nn.BatchNorm1d(transformer_hidden_dim)
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+        for m in self.modules():
+            if isinstance(m, nn.ConvTranspose2d) \
+            or isinstance(m, nn.Linear) \
+            or isinstance(object, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.normal_(m.weight, mean=0, std=0.001)
+
+    def linearblock(self, indim, outdim):
+        block2 = [
+            nn.Linear(indim, outdim),
+            nn.BatchNorm1d(outdim),
+            nn.ReLU()
+        ]
+        return block2
+
+    def forward(self, tgt, pred_cameras, memory, pos_embed, mask):
+        batch_size = memory.shape[1]
+        num_views = tgt.shape[0]
+        projected_pose = self.proj_pose(pred_cameras)
+
+        # query_embed = self.camera_query_embedding.weight
+
+        # query_embed = query_embed.unsqueeze(1).repeat(
+        #     num_views, batch_size, 1
+        # )
+
+        decoder_output = self.decoder(
+            tgt,
+            memory,
+            memory_key_padding_mask=mask,
+            pos=pos_embed,
+            query_pos=projected_pose,
+        )
+        decoder_output = decoder_output[0]
+        decoder_output = decoder_output.permute(1, 0, 2).contiguous().view(-1, self.transformer_hidden_dim)
+        cameras = self.linear(decoder_output)
+        cameras = pred_cameras.permute(1, 0, 2).contiguous().view(-1, 7) + cameras
+
+        return cameras
 
 
 class Attention(nn.Module):
@@ -756,7 +819,7 @@ class MeshFormer(nn.Module):
 class MultiViewMeshFormer(nn.Module):
     """This is the base class for Transformer based mesh reconstruction"""
 
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False):
         """Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -768,6 +831,7 @@ class MultiViewMeshFormer(nn.Module):
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
         self.load_pretrained = load_pretrained
+        self.refine_pose = refine_pose
 
         self.backbone = build_backbone("resnet18", load_pretrained=load_pretrained)
         # self.transformer = build_transformer(nheads=4, enc_layers=2, dec_layers=2)
@@ -881,6 +945,9 @@ class MultiViewMeshFormer(nn.Module):
         )
         self.camera_decoder = CameraDecoder(d_model, decoder, azi_scope, elev_range, dist_range)
 
+        if self.refine_pose:
+            self.pose_refiner = PoseDecoder(d_model + self.pose_embed_size, decoder)
+
         # light decoder
         decoder_layer = TransformerDecoderLayer(
             d_model,
@@ -940,7 +1007,7 @@ class MultiViewMeshFormer(nn.Module):
         mask_vec = mask.flatten(1)  # BxHW
         return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
 
-    def forward(self, x, gt_poses, use_gt_pose=True):
+    def forward(self, x, gt_poses, use_gt_pose=False):
         device = x.device
         # pretrained assume we only have RGB, no mask as 4th channel
         if self.load_pretrained:
@@ -1053,6 +1120,16 @@ class MultiViewMeshFormer(nn.Module):
 
         delta_vertices = self.shape_decoder(shape_memory, self.vertices_init.to(device), shape_pos_embed, mask)
         
+        if self.refine_pose:
+            pred_cameras = self.pose_refiner(
+                tgt.view(batch_size, num_views, -1)[:, 1:, :].permute(1, 0, 2).contiguous(), 
+                pred_cameras.view(batch_size, num_views - 1, -1).permute(1, 0, 2).contiguous(), 
+                shape_memory, 
+                shape_pos_embed, 
+                mask
+            )
+            # pred_cameras = self.pose_refiner(pred_cameras.view(batch_size, num_views - 1, -1).permute(1, 0, 2).contiguous(), memory, mask=mask, pos_embed=pos_embed)
+
 
         # lights = self.light_decoder(memory, pos_embed, mask)
         # lights = lights.repeat_interleave(num_views, dim=0)

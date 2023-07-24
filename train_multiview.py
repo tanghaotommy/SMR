@@ -1,4 +1,5 @@
 import argparse
+from collections import defaultdict
 import os
 import random
 import math
@@ -42,6 +43,8 @@ from utils import camera_position_from_spherical_angles, generate_transformation
 from models.model import VGG19, CameraEncoder, ShapeEncoder, LightEncoder, TextureEncoder, MultiViewTextureEncoder
 from models.meshformer import MultiViewMeshFormer
 from eval_utils import compute_pose_metric
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -76,49 +79,77 @@ parser.add_argument('--amodal', type=int, default=0, help='which amodal type to 
 parser.add_argument('--model', help='model name', default='SMR')
 parser.add_argument('--visualization_epoch', type=int, default=1)
 parser.add_argument('--val_epoch', type=int, default=10)
+parser.add_argument('--ddp', action='store_true', default=False, help='whether use distributedparallel')
+parser.add_argument('--n_gpu_per_node', type=int, default=2, help='number of GPUs per node')
 
 opt = parser.parse_args()
-print(opt)
+# print(opt)
 
-if opt.manualSeed is None:
-    opt.manualSeed = random.randint(1, 10000)
-print("Random Seed: ", opt.manualSeed)
-random.seed(opt.manualSeed)
-torch.manual_seed(opt.manualSeed)
+# if opt.manualSeed is None:
+#     opt.manualSeed = random.randint(1, 10000)
+# # print("Random Seed: ", opt.manualSeed)
+# random.seed(opt.manualSeed)
+# torch.manual_seed(opt.manualSeed)
 
-if torch.cuda.is_available() and not opt.cuda:
-    print("WanING: You have a CUDA device, so you should probably run with --cuda")
+TRAINING_CATEGORIES = [
+    "apple",
+    "backpack",
+    "banana",
+    "baseballbat",
+    "baseballglove",
+    "bench",
+    "bicycle",
+    "bottle",
+    "bowl",
+    "broccoli",
+    "cake",
+    "car",
+    "carrot",
+    "cellphone",
+    "chair",
+    "cup",
+    "donut",
+    "hairdryer",
+    "handbag",
+    "hydrant",
+    "keyboard",
+    "laptop",
+    "microwave",
+    "motorcycle",
+    "mouse",
+    "orange",
+    "parkingmeter",
+    "pizza",
+    "plant",
+    "stopsign",
+    "teddybear",
+    "toaster",
+    "toilet",
+    "toybus",
+    "toyplane",
+    "toytrain",
+    "toytruck",
+    "tv",
+    "umbrella",
+    "vase",
+    "wineglass",
+]
 
-if opt.dataset == "bird":
-    train_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=True)
-    test_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=False)
-elif opt.dataset == "co3d":
-    train_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=True, categories=["bottle"], amodal=opt.amodal)
-    test_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=False, categories=["bottle"], amodal=opt.amodal)
-# elif opt.dataset == "co3d_seq":
-#     train_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
-#     test_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
-elif opt.dataset == "co3d_seq":
-    # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train_frame_split", categories=["toyplane"], sample_mode="near20")
-    # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val_frame_split", categories=["toyplane"], sample_mode="near20")
-    train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane"])
-    test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane"])
-    # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane", "teddybear", "bottle", "bowl", 
-    #                                                                             "cup", "laptop", "mouse", "remote"])
-    # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane", "teddybear", "bottle", "bowl", 
-    #                                                                             "cup", "laptop", "mouse", "remote"])
-elif opt.dataset == "shapenet":
-    train_dataset = ShapeNetMultiView(opt.dataroot, "train", category_ids=["02691156"])
-    test_dataset = ShapeNetMultiView(opt.dataroot, "val", category_ids=["02691156"])
-    test_dataset.object_path = test_dataset.object_path[:10]
-else:
-    raise NotImplementedError
+# TRAINING_CATEGORIES = ["bicycle"]
 
+TEST_CATEGORIES = [
+    "ball",
+    "book",
+    "couch",
+    "frisbee",
+    "hotdog",
+    "kite",
+    "remote",
+    "sandwich",
+    "skateboard",
+    "suitcase",
+]
 
-train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batchSize,
-                                         shuffle=True, drop_last=True, pin_memory=True, num_workers=int(opt.workers))
-test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batchSize,
-                                         shuffle=False, pin_memory=True, num_workers=int(opt.workers))
 
 def deep_copy(att, index=None, detach=False):
     if index is None:
@@ -489,14 +520,14 @@ class AttributeEncoder(nn.Module):
 
 
 class MeshFormerEncoder(nn.Module):
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False):
         super(MeshFormerEncoder, self).__init__()
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
         self.use_multi_view_texture = use_multi_view_texture
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
-        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range)
+        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose)
         if self.use_multi_view_texture:
             self.texture_enc = MultiViewTextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
         else:
@@ -505,13 +536,13 @@ class MeshFormerEncoder(nn.Module):
         # self.feat_enc = FeatEncoder(nc=4, nf=32)
         self.feat_enc = VGG19()
 
-    def forward(self, x, gt_poses):
+    def forward(self, x, gt_poses, use_gt_pose=False):
         device = x.device
         batch_size, num_views, C, H, W = x.shape
         input_img = x
 
         # meshformer
-        delta_vertices, cameras, lights, textures, pred_cameras, shape_memory = self.meshformer(input_img, gt_poses)
+        delta_vertices, cameras, lights, textures, pred_cameras, shape_memory = self.meshformer(input_img, gt_poses, use_gt_pose=use_gt_pose)
 
         # # cameras
         # cameras = self.camera_enc(input_img)
@@ -593,7 +624,49 @@ def weights_init(m):
         m.weight.data.normal_(1.0, 0.02)
         m.bias.data.fill_(0)
 
-if __name__ == '__main__':
+
+def train_main(rank, size):
+    device = torch.device("cuda:{}".format(rank))
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{rank}"
+
+    if opt.dataset == "bird":
+        train_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=True)
+        test_dataset = BirdDataset(opt.dataroot, opt.imageSize, train=False)
+    elif opt.dataset == "co3d":
+        train_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=True, categories=["bottle"], amodal=opt.amodal)
+        test_dataset = Co3DDataset(opt.dataroot, opt.imageSize, train=False, categories=["bottle"], amodal=opt.amodal)
+    # elif opt.dataset == "co3d_seq":
+    #     train_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
+    #     test_dataset = Co3DSeqDataset(opt.dataroot, "train", image_size=opt.imageSize, categories=["toyplane"], amodal=opt.amodal)
+    elif opt.dataset == "co3d_seq":
+        # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train_frame_split", categories=["toyplane"], sample_mode="near20")
+        # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val_frame_split", categories=["toyplane"], sample_mode="near20")
+        train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=TRAINING_CATEGORIES)
+        test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=TRAINING_CATEGORIES)
+        # train_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "train", categories=["toyplane", "teddybear", "bottle", "bowl", 
+        #                                                                             "cup", "laptop", "mouse", "remote"])
+        # test_dataset = Co3DSeqNormalizedDataset(opt.dataroot, "val", categories=["toyplane", "teddybear", "bottle", "bowl", 
+        #                                                                             "cup", "laptop", "mouse", "remote"])
+    elif opt.dataset == "shapenet":
+        train_dataset = ShapeNetMultiView(opt.dataroot, "train", category_ids=["02691156"])
+        test_dataset = ShapeNetMultiView(opt.dataroot, "val", category_ids=["02691156"])
+        test_dataset.object_path = test_dataset.object_path[:10]
+    else:
+        raise NotImplementedError
+    
+    if opt.ddp:
+        training_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, rank=rank, shuffle=True)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, rank=rank, shuffle=False)
+    else:
+        training_sampler = test_sampler = None
+
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batchSize, sampler=training_sampler,
+                                            shuffle=None if opt.ddp else True, drop_last=True, pin_memory=True, num_workers=int(opt.workers))
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batchSize, sampler=test_sampler,
+                                            shuffle=None if opt.ddp else False, pin_memory=True, num_workers=int(opt.workers))
+
+    print(f"Rank {rank}, dataset: {len(train_dataset)}, dataloader: {len(train_dataloader)}")
+
     # differentiable renderer
     diffRender = DiffRender(filename_obj=opt.template_path, image_size=opt.imageSize)
 
@@ -605,33 +678,16 @@ if __name__ == '__main__':
     elif opt.model == "MeshFormer":
         netE = MeshFormerEncoder(num_vertices=diffRender.num_vertices, vertices_init=diffRender.vertices_init, 
                                 azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range,
-                                nc=4, nk=opt.nk, nf=opt.nf)
+                                nc=4, nk=opt.nk, nf=opt.nf, refine_pose=False)
     else:
         raise NotImplementedError
-
-    if opt.multigpus:
-        netE = torch.nn.DataParallel(netE)
+    
     netE = netE.cuda()
 
-    # netL: for Landmark Consistency
-    netL = Landmark_Consistency(num_landmarks=diffRender.num_faces, dim_feat=256, num_samples=64)
-    if opt.multigpus:
-        netL = torch.nn.DataParallel(netL)
-    netL = netL.cuda()
-
-    # netD: Discriminator
-    netD = Discriminator(nc=4, nf=64)
-    netD.apply(weights_init)
-    if opt.multigpus:
-        netD = torch.nn.DataParallel(netD)
-    netD = netD.cuda()
-
     # setup optimizer
-    optimizerD = optim.Adam(netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-    optimizerE = optim.Adam(list(netE.parameters()) + list(netL.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
+    optimizerE = optim.AdamW(list(netE.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
 
     # setup learning rate scheduler
-    schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, T_max=opt.niter, eta_min=1e-6)
     schedulerE = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerE, T_max=opt.niter, eta_min=1e-6)
     # schedulerE = torch.optim.lr_scheduler.StepLR(optimizerE, step_size=200, gamma=0.5)
 
@@ -640,35 +696,35 @@ if __name__ == '__main__':
     start_epoch = 0
     if opt.resume:
         resume_path = os.path.join(opt.outf, 'ckpts/latest_ckpt.pth')
-        if os.path.exists(resume_path):
-            print("=> loading checkpoint '{}'".format(opt.resume))
-            # Map model to be loaded to specified single gpu.
-            checkpoint = torch.load(resume_path)
-            start_epoch = checkpoint['epoch']
-            start_iter = 0
-            netD.load_state_dict(checkpoint['netD'])
-            netE.load_state_dict(checkpoint['netE'])
+        if rank == 0:
+            if os.path.exists(resume_path):
+                print("=> loading checkpoint '{}'".format(opt.resume))
+                # Map model to be loaded to specified single gpu.
+                checkpoint = torch.load(resume_path)
+                start_epoch = checkpoint['epoch']
+                start_iter = 0
+                netE.load_state_dict(checkpoint['netE'])
 
-            optimizerD.load_state_dict(checkpoint['optimizerD'])
-            optimizerE.load_state_dict(checkpoint['optimizerE'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                .format(resume_path, checkpoint['epoch']))
-        else:
-            start_iter = 0
-            start_epoch = 0
-            print("=> no checkpoint can be found")
-
+                optimizerE.load_state_dict(checkpoint['optimizerE'])
+                print("=> loaded checkpoint '{}' (epoch {})"
+                    .format(resume_path, checkpoint['epoch']))
+            else:
+                start_iter = 0
+                start_epoch = 0
+                print("=> no checkpoint can be found")
 
     ori_dir = os.path.join(opt.outf, 'fid/ori')
     rec_dir = os.path.join(opt.outf, 'fid/rec')
     inter_dir = os.path.join(opt.outf, 'fid/inter')
     ckpt_dir = os.path.join(opt.outf, 'ckpts')
-    os.makedirs(ori_dir, exist_ok=True)
-    os.makedirs(rec_dir, exist_ok=True)
-    os.makedirs(inter_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
 
-    summary_writer = SummaryWriter(os.path.join(opt.outf + "/logs"))
+    if rank == 0:
+        os.makedirs(ori_dir, exist_ok=True)
+        os.makedirs(rec_dir, exist_ok=True)
+        os.makedirs(inter_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        summary_writer = SummaryWriter(os.path.join(opt.outf + "/logs"))
 
     for epoch in range(start_epoch, opt.niter):
         lossR_all = []
@@ -678,15 +734,15 @@ if __name__ == '__main__':
         lossR_cam_quat_all = []
         loss_pose_all = []
         loss_trans_all = []
-        rot_error_all = []
-        trans_error_all = []
+        rot_error_all = defaultdict(list)
+        rot_gt_all = defaultdict(list)
+        trans_error_all = defaultdict(list)
         input_key = "original_images"
         for iter, data in enumerate(train_dataloader):
             with Timer("Elapsed time in update: %f"):
                 ############################
                 # (1) Update D network
                 ###########################
-                optimizerD.zero_grad()
                 Xa = Variable(data['data']['images']).cuda()
                 # Ea = Variable(data['data']['edge']).cuda()
                 absolute_poses = data['data']['absolute_poses'].cuda()
@@ -694,6 +750,7 @@ if __name__ == '__main__':
                 cam_quat_gt = data['data']['relative_poses_quat'].cuda()
                 focal_length = data['data']['focal_length'].cuda()
                 center = data["data"]["center"].cuda()
+                category = data["data"]["category"]
                 batch_size = Xa.shape[0]
                 num_views = Xa.shape[1]
 
@@ -760,7 +817,7 @@ if __name__ == '__main__':
 
 
                 # encode real
-                Ae = netE(Xb, cam_quat_gt)
+                Ae = netE(Xb, cam_quat_gt, use_gt_pose=True)
                 Ae["absolute_poses"] = absolute_poses
                 Ae["focal_length"] = focal_length
                 Ae["center"] = center
@@ -864,8 +921,12 @@ if __name__ == '__main__':
                 loss = 0.0
                 # Merge the batch_size and num_views dim
                 cam_quat_gt = cam_quat_gt.view(batch_size * (num_views - 1), -1)
-                loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4])
-                loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:])
+
+                # some gt trans are inf, ignore these entry
+                loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
+                loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:], reduction='none')
+                loss_pose = loss_pose[loss_pose < 10].mean()
+                loss_trans = loss_trans[loss_trans < 10].mean()
                 lossR_cam_quat = loss_pose + loss_trans
                 # lossR_cam = lossR_cam_quat
                 # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam
@@ -873,34 +934,42 @@ if __name__ == '__main__':
                 # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
                 lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
                 # lossR = lossR_cam_quat
-                rot_error, trans_error = 0.0, 0.0
-                rot_all = 0.0
+                rot_error, trans_error = defaultdict(list), defaultdict(list)
+                rot_all = defaultdict(list)
                 canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
                 for img_idx in range(len(cam_quat_gt)):
+                    b_id = img_idx // (num_views - 1)
+                    cat = category[b_id]
                     cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
                                                                          cam_quat_gt[img_idx].detach().cpu())
                     cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
                                                     canonical.detach().cpu())
-                    rot_all += cur_rot
-                    rot_error += cur_rot_error if cur_rot_error < 50 else 50
-                    trans_error += cur_trans_error
+                    rot_all[cat].append(cur_rot)
+                    rot_error[cat].append(cur_rot_error)
+                    trans_error[cat].append(cur_trans_error)
 
-                rot_error /= len(cam_quat_gt)
-                trans_error /= len(cam_quat_gt)
-                rot_all /= len(cam_quat_gt)
+                for k in rot_all.keys():
+                    rot_error[k] = np.nanmean(rot_error[k])
+                    trans_error[k] = np.nanmean(trans_error[k])
+                    rot_all[k] = np.nanmean(rot_all[k])
 
                 lossR.backward()
+                torch.nn.utils.clip_grad_norm_(netE.parameters(), max_norm=2.0, norm_type=2)
                 optimizerE.step()
 
-                print('Name: ', opt.outf)
-                print('[%d/%d][%d/%d]\n'
-                'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
-                'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f rot_all: %.4f \n'
-                    % (epoch, opt.niter, iter, len(train_dataloader),
-                        lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                        loss_pose.item(), loss_trans.item(), lossR_IC.item(), rot_error, trans_error, rot_all
-                        )
-                )
+                if rank == 0:
+                    print('Name: ', opt.outf)
+                    print('[%d/%d][%d/%d]\n'
+                    'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
+                    'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f rot_all: %.4f \n'
+                        % (epoch, opt.niter, iter, len(train_dataloader),
+                            lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
+                            loss_pose.item(), loss_trans.item(), lossR_IC.item(), 
+                            np.mean([v for _, v in rot_error.items()]), 
+                            np.mean([v for _, v in trans_error.items()]), 
+                            np.mean([v for _, v in rot_all.items()]), 
+                            )
+                    )
 
                 lossR_all.append(lossR.item())
                 lossR_reg_all.append(lossR_reg.item())
@@ -909,12 +978,14 @@ if __name__ == '__main__':
                 lossR_data_all.append(lossR_data.item())
                 loss_pose_all.append(loss_pose.item())
                 loss_trans_all.append(loss_trans.item())
-                rot_error_all.append(rot_error)
-                trans_error_all.append(trans_error)
-        schedulerD.step()
+
+                for k in rot_all.keys():
+                    rot_error_all[k].append(rot_error[k])
+                    rot_gt_all[k].append(rot_all[k])
+                    trans_error_all[k].append(trans_error[k])
         schedulerE.step()
 
-        if epoch % 1 == 0:
+        if epoch % 1 == 0 and rank == 0:
             summary_writer.add_scalar('Train/lr', schedulerE.get_last_lr()[0], epoch)
             summary_writer.add_scalar('Train/lossR', np.average(lossR_all), epoch)
             summary_writer.add_scalar('Train/lossR_reg', np.average(lossR_reg_all), epoch)
@@ -923,25 +994,17 @@ if __name__ == '__main__':
             summary_writer.add_scalar('Train/lossR_cam_quat', np.average(lossR_cam_quat_all), epoch)
             summary_writer.add_scalar('Train/loss_pose', np.average(loss_pose_all), epoch)
             summary_writer.add_scalar('Train/loss_trans', np.average(loss_trans_all), epoch)
-            summary_writer.add_scalar('Train/rot_error', np.average(rot_error_all), epoch)
-            summary_writer.add_scalar('Train/rot_all', np.average(rot_all), epoch)
-            summary_writer.add_scalar('Train/trans_error', np.average(trans_error_all), epoch)
+            summary_writer.add_scalar(f'Train/rot_gt', np.average([np.average(v) for _, v in rot_gt_all.items()]), epoch)
+            summary_writer.add_scalar(f'Train/rot_error', np.average([np.average(v) for _, v in rot_error_all.items()]), epoch)
+            summary_writer.add_scalar(f'Train/trans_error', np.average([np.average(v) for _, v in trans_error_all.items()]), epoch)
+            
+            for k in rot_error_all.keys():
+                summary_writer.add_scalar(f'Train/rot_gt_{k}', np.average(rot_gt_all[k]), epoch)
+                summary_writer.add_scalar(f'Train/rot_error_{k}', np.average(rot_error_all[k]), epoch)
+                summary_writer.add_scalar(f'Train/trans_error_{k}', np.average(trans_error_all[k]), epoch)
 
-            # summary_writer.add_scalar('Train/lossR', lossR.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_fake', lossR_fake.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_reg', lossR_reg.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_data', lossR_data.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_IC', lossR_IC.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_LC', lossR_LC.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_flip', lossR_flip.item(), epoch)
-            # # summary_writer.add_scalar('Train/lossR_cam', lossR_cam.item(), epoch)
-            # summary_writer.add_scalar('Train/lossR_cam_quat', lossR_cam_quat.item(), epoch)
-            # summary_writer.add_scalar('Train/loss_pose', loss_pose.item(), epoch)
-            # summary_writer.add_scalar('Train/loss_trans', loss_trans.item(), epoch)
-            # summary_writer.add_scalar('Train/rot_error', rot_error, epoch)
-            # summary_writer.add_scalar('Train/trans_error', trans_error, epoch)
 
-        if epoch % opt.visualization_epoch == 0:
+        if epoch % opt.visualization_epoch == 0 and rank == 0:
             num_images = Xa.shape[0]
             textures = Ae['textures']
 
@@ -1024,15 +1087,13 @@ if __name__ == '__main__':
             current_rotate_path = os.path.join(opt.outf, 'current_rotation.gif')
             shutil.copyfile(rotate_path, current_rotate_path)
 
-        if epoch % 2 == 0:
+        if epoch % 2 == 0 and rank == 0:
             epoch_name = os.path.join(ckpt_dir, 'epoch_%05d.pth' % epoch)
             latest_name = os.path.join(ckpt_dir, 'latest_ckpt.pth')
             state_dict = {
                 'epoch': epoch,
                 'netE': netE.state_dict(),
-                'netD': netD.state_dict(),
                 'optimizerE': optimizerE.state_dict(),
-                'optimizerD': optimizerD.state_dict(),
             }
             torch.save(state_dict, latest_name)
 
@@ -1045,8 +1106,9 @@ if __name__ == '__main__':
             lossR_cam_quat_all = []
             loss_pose_all = []
             loss_trans_all = []
-            rot_error_all = []
-            trans_error_all = []
+            rot_error_all = defaultdict(list)
+            rot_gt_all = defaultdict(list)
+            trans_error_all = defaultdict(list)
 
             for i, data in tqdm.tqdm(enumerate(test_dataloader)):
                 Xa = Variable(data['data']['images']).cuda()
@@ -1056,6 +1118,7 @@ if __name__ == '__main__':
                 cam_quat_gt = data['data']['relative_poses_quat'].cuda()
                 focal_length = data['data']['focal_length'].cuda()
                 center = data["data"]["center"].cuda()
+                category = data["data"]["category"]
                 batch_size = Xa.shape[0]
                 num_views = Xa.shape[1]
 
@@ -1065,7 +1128,7 @@ if __name__ == '__main__':
 
 
                 # encode real
-                Ae = netE(Xb, cam_quat_gt)
+                Ae = netE(Xb, cam_quat_gt, use_gt_pose=True)
                 Ae["absolute_poses"] = absolute_poses
                 Ae["focal_length"] = focal_length
                 Ae["center"] = center
@@ -1092,25 +1155,40 @@ if __name__ == '__main__':
                 loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:])
                 lossR_cam_quat = loss_pose + loss_trans
                 lossR = lossR_cam_quat
-
-                rot_error, trans_error = 0.0, 0.0
+                rot_error, trans_error = defaultdict(list), defaultdict(list)
+                rot_all = defaultdict(list)
+                canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
                 for img_idx in range(len(cam_quat_gt)):
+                    b_id = img_idx // (num_views - 1)
+                    cat = category[b_id]
                     cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
                                                                          cam_quat_gt[img_idx].detach().cpu())
-                    rot_error += cur_rot_error if cur_rot_error < 50 else 50
-                    trans_error += cur_trans_error
+                    
+                    # cur_trans_error = loss_trans.cpu().data.numpy()
+                    # cur_rot_error = compute_angular_error(cam_rot_gt[img_idx].detach().cpu().numpy(), cam_rot_pred[img_idx].detach().cpu().numpy())
+                    cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
+                                                    canonical.detach().cpu())
+                    rot_all[cat].append(cur_rot)
+                    rot_error[cat].append(cur_rot_error)
+                    trans_error[cat].append(cur_trans_error)
 
-                rot_error /= len(cam_quat_gt)
-                trans_error /= len(cam_quat_gt)
+                for k in rot_all.keys():
+                    rot_error[k] = np.nanmean(rot_error[k])
+                    trans_error[k] = np.nanmean(trans_error[k])
+                    rot_all[k] = np.nanmean(rot_all[k])
 
-                print('Val [%d/%d][%d/%d]\n'
-                'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
-                'rot_error: %.4f trans_error: %.4f \n'
-                    % (epoch, opt.niter, iter, len(test_dataloader),
-                        lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                        loss_pose.item(), loss_trans.item(), rot_error, trans_error
-                        )
-                )
+                if rank == 0:
+                    print('Val [%d/%d][%d/%d]\n'
+                    'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
+                    'rot_all: %.4f rot_error: %.4f trans_error: %.4f \n'
+                        % (epoch, opt.niter, iter, len(test_dataloader),
+                            lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
+                            loss_pose.item(), loss_trans.item(), 
+                            np.mean([v for _, v in rot_all.items()]), 
+                            np.mean([v for _, v in rot_error.items()]), 
+                            np.mean([v for _, v in trans_error.items()]), 
+                            )
+                    )
                 lossR_all.append(lossR.item())
                 lossR_reg_all.append(lossR_reg.item())
                 lossR_flip_all.append(lossR_flip.item())
@@ -1118,66 +1196,51 @@ if __name__ == '__main__':
                 lossR_data_all.append(lossR_data.item())
                 loss_pose_all.append(loss_pose.item())
                 loss_trans_all.append(loss_trans.item())
-                rot_error_all.append(rot_error)
-                trans_error_all.append(trans_error)
 
-            summary_writer.add_scalar('Val/lossR', np.average(lossR_all), epoch)
-            summary_writer.add_scalar('Val/lossR_reg', np.average(lossR_reg_all), epoch)
-            summary_writer.add_scalar('Val/lossR_data', np.average(lossR_data_all), epoch)
-            summary_writer.add_scalar('Val/lossR_flip', np.average(lossR_flip_all), epoch)
-            summary_writer.add_scalar('Val/lossR_cam_quat', np.average(lossR_cam_quat_all), epoch)
-            summary_writer.add_scalar('Val/loss_pose', np.average(loss_pose_all), epoch)
-            summary_writer.add_scalar('Val/loss_trans', np.average(loss_trans_all), epoch)
-            summary_writer.add_scalar('Val/rot_error', np.average(rot_error_all), epoch)
-            summary_writer.add_scalar('Val/trans_error', np.average(trans_error_all), epoch)
+                for k in rot_all.keys():
+                    rot_error_all[k].append(rot_error[k])
+                    rot_gt_all[k].append(rot_all[k])
+                    trans_error_all[k].append(trans_error[k])
+
+            if rank == 0:
+                summary_writer.add_scalar('Val/lossR', np.average(lossR_all), epoch)
+                summary_writer.add_scalar('Val/lossR_reg', np.average(lossR_reg_all), epoch)
+                summary_writer.add_scalar('Val/lossR_data', np.average(lossR_data_all), epoch)
+                summary_writer.add_scalar('Val/lossR_flip', np.average(lossR_flip_all), epoch)
+                summary_writer.add_scalar('Val/lossR_cam_quat', np.average(lossR_cam_quat_all), epoch)
+                summary_writer.add_scalar('Val/loss_pose', np.average(loss_pose_all), epoch)
+                summary_writer.add_scalar('Val/loss_trans', np.average(loss_trans_all), epoch)
+
+                summary_writer.add_scalar(f'Val/rot_gt', np.average([np.average(v) for _, v in rot_gt_all.items()]), epoch)
+                summary_writer.add_scalar(f'Val/rot_error', np.average([np.average(v) for _, v in rot_error_all.items()]), epoch)
+                summary_writer.add_scalar(f'Val/trans_error', np.average([np.average(v) for _, v in trans_error_all.items()]), epoch)
+                
+                for k in rot_error_all.keys():
+                    summary_writer.add_scalar(f'Val/rot_gt_{k}', np.average(rot_gt_all[k]), epoch)
+                    summary_writer.add_scalar(f'Val/rot_error_{k}', np.average(rot_error_all[k]), epoch)
+                    summary_writer.add_scalar(f'Val/trans_error_{k}', np.average(trans_error_all[k]), epoch)
+
             netE.train()
 
 
-        #         Xa = Variable(data['data']['images']).cuda()
-        #         paths = data['data']['path']
+def init_process(rank, size, fn, backend='gloo'):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+    dist.init_process_group(backend, rank=rank, world_size=size)
+    fn(rank, size)
 
-        #         with torch.no_grad():
-        #             Ae = netE(Xa)
-        #             Xer, Ae = diffRender.render(**Ae)
+if __name__ == '__main__':
+    if opt.ddp:
+        size = opt.n_gpu_per_node
+        processes = []
+        mp.set_start_method("spawn")
+        for rank in range(size):
+            p = mp.Process(target=init_process, args=(rank, size, train_main))
+            p.start()
+            processes.append(p)
 
-        #             batch_size, num_views, C, H, W = Xa.shape
-
-        #             # Get the first view for each object
-        #             l = np.array(range(0, batch_size*num_views, num_views))
-        #             Ai = deep_copy(Ae, index=l)
-        #             Ai['azimuths'] = - torch.empty((Xa.shape[0]), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
-        #             Xir, Ai = diffRender.render(**Ai)
-
-        #             for i in range(len(paths)):
-        #                 path = paths[i][0] # only sample the first view for each multi-view input
-        #                 image_name = os.path.basename(path)
-        #                 rec_path = os.path.join(rec_dir, image_name)
-        #                 output_Xer = to_pil_image(Xer[i, :3].detach().cpu())
-        #                 output_Xer.save(rec_path, 'JPEG', quality=100)
-
-        #                 inter_path = os.path.join(inter_dir, image_name)
-        #                 output_Xir = to_pil_image(Xir[i, :3].detach().cpu())
-        #                 output_Xir.save(inter_path, 'JPEG', quality=100)
-
-        #                 ori_path = os.path.join(ori_dir, image_name)
-        #                 output_Xa = to_pil_image(Xa[i, 0, :3].detach().cpu())
-        #                 output_Xa.save(ori_path, 'JPEG', quality=100)
-
-        #                 gt_mask = Xa[i, 0, 3].detach().cpu()
-        #                 pred_mask = Xer[i * num_views, 3].detach().cpu()
-        #                 loss_mask = kal.metrics.render.mask_iou(pred_mask.unsqueeze(0), gt_mask.unsqueeze(0)).item()
-
-        #                 mask_ious.append(1 - loss_mask)
-
-        #     mask_iou = np.mean(mask_ious)
-        #     print('Test mask iou: %0.2f' % mask_iou)
-        #     summary_writer.add_scalar('Test/mask_iou', mask_iou, epoch)
-
-        #     fid_recon = calculate_fid_given_paths([ori_dir, rec_dir], 32, True)
-        #     print('Test recon fid: %0.2f' % fid_recon)
-        #     summary_writer.add_scalar('Test/fid_recon', fid_recon, epoch)
-
-        #     fid_inter = calculate_fid_given_paths([ori_dir, inter_dir], 32, True)
-        #     print('Test rotation fid: %0.2f' % fid_inter)
-        #     summary_writer.add_scalar('Test/fid_inter', fid_inter, epoch)
-        #     netE.train()
+        for p in processes:
+            p.join()
+    else:
+        train_main(0, 1)

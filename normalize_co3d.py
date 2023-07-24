@@ -94,7 +94,7 @@ def pose_compose(pose0, pose1):
 def pytorch3d_to_opencv(R, T):
     pass
 
-def read_co3d_pose_from_dict(pose_dict, key):
+def read_co3d_pose_from_dict(pose_dict, key, version="v1"):
     entry = pose_dict[key]
     vp = entry["viewpoint"]
     R = torch.tensor(vp["R"], dtype=torch.float)
@@ -112,7 +112,14 @@ def read_co3d_pose_from_dict(pose_dict, key):
     principal_point_px = (
         -1.0 * (principal_point - 1.0) * half_image_size_wh_orig
     )
-    focal_length_px = focal_length * half_image_size_wh_orig
+    if version == "v1":
+        focal_length_px = focal_length * half_image_size_wh_orig
+    elif version == "v2":
+        half_min_image_size_output = half_image_size_wh_orig.min()
+        focal_length_px = focal_length * half_min_image_size_output
+    else:
+        raise NotImplementedError
+
     K = torch.FloatTensor([
         [focal_length_px[0], 0, principal_point_px[0]],
         [0, focal_length_px[1], principal_point_px[1]],
@@ -178,10 +185,14 @@ def normalize_views(ref_poses, ref_Ks, verts, images, masks, ref_size=128, margi
     
 
 def process_one_scan(data):
-    scene_path, pose_dict = data
+    scene_path, pose_dict, version = data
     mask_dir = os.path.join(scene_path, "masks")
     image_dir = os.path.join(scene_path, "images")
     pointcloud_path = os.path.join(co3d_raw_dir, scene_path, "pointcloud.ply")
+    if not os.path.exists(os.path.join(co3d_raw_dir, image_dir)):
+        print(f"{scene_path} does not have images!")
+        return
+
     frame_ids = [f.split(".jpg")[0] for f in os.listdir(os.path.join(co3d_raw_dir, image_dir))]
     if not os.path.exists(pointcloud_path):
         return
@@ -193,7 +204,7 @@ def process_one_scan(data):
     for frame_id in frame_ids:
         images.append(plt.imread(os.path.join(co3d_raw_dir, image_dir, f"{frame_id}.jpg")))
         masks.append(plt.imread(os.path.join(co3d_raw_dir, mask_dir, f"{frame_id}.png")))
-        R, T, K = read_co3d_pose_from_dict(pose_dict, os.path.join(scene_path, "images", f"{frame_id}.jpg"))
+        R, T, K = read_co3d_pose_from_dict(pose_dict, os.path.join(scene_path, "images", f"{frame_id}.jpg"), version=version)
 
         # pytorch3d uses column vector, need to transpose R
         RT = torch.cat([R.T, T.unsqueeze(1)], dim=1)
@@ -226,9 +237,18 @@ def process_one_scan(data):
 
 ref_size = 128
 margin = 0.05
-co3d_raw_dir = "/datasets01/co3d/081922"
-co3d_normalized_dir = "/checkpoint/haotang/data/co3d_normalized"
-categories = ["cup", "laptop", "mouse", "bottle", "cake", "bowl", "vase", "book", "remote", "tv"]
+co3d_raw_dir = "/datasets01/co3dv2/080422/"
+co3d_normalized_dir = "/checkpoint/haotang/data/co3d_v2_normalized_128"
+categories = [
+    # 'apple', 'backpack', 'ball', 'banana', 'baseballbat', 'baseballglove', 
+    # 'bench', 'bicycle', 'book', 'bottle', 'bowl', 'broccoli', 'cake', 'car', 
+    # 'carrot', 'cellphone', 'chair', 'couch', 'cup', 'donut', 'frisbee', 'hairdryer', 
+    # 'handbag', 'hotdog', 'hydrant', 'keyboard', 'kite', 'laptop', 'microwave', 
+    # 'motorcycle', 'mouse', 'orange', 'parkingmeter', 'pizza', 'plant', 'remote', 
+    # 'sandwich', 'skateboard', 'stopsign', 'suitcase', 'teddybear', 'toaster', 'toilet', 
+    'toybus', 'toyplane', 'toytrain', 'toytruck', 'tv', 'umbrella', 'vase', 'wineglass'
+]
+version = "v2"
 
 def main():
     pose_dict = {}
@@ -251,7 +271,8 @@ def main():
 
         scene_paths.extend([os.path.join(cat, scene_id) for scene_id in valid_scene_ids])
 
-    data = [[scene_path, pose_dict] for scene_path in scene_paths]
+    data = [[scene_path, pose_dict, version] for scene_path in scene_paths]
+    print(len(data))
     num_processes = 8
     pool = multiprocessing.Pool(num_processes)
     pool.map(process_one_scan, data)

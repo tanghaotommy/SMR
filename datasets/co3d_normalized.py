@@ -72,6 +72,9 @@ class Co3DSeqNormalizedDataset(Dataset):
         rgb = torch.cat([t_rgb, t_s], dim=-1).permute(2, 0, 1)
         original_rgb = torch.cat([torch.from_numpy(img) / 255.0, t_s], dim=-1).permute(2, 0, 1)
 
+        # rgb = torchvision.transforms.Grayscale()(rgb[:3])
+        # original_rgb = torchvision.transforms.Grayscale()(original_rgb[:3])
+
         # if self.mode[:5] == "train":
         #     transformed_joint = transform(torch.cat([rgb, original_rgb], dim=0))
         #     rgb, original_rgb = transformed_joint[:4], transformed_joint[4:]
@@ -80,6 +83,7 @@ class Co3DSeqNormalizedDataset(Dataset):
     
     def __getitem__(self, index):
         scene_path = self.scene_paths[index]
+        category = scene_path.split("/")[0]
         verts, _ = pytorch3d.io.load_ply(os.path.join(self.root, scene_path, "pointcloud.ply"))
         with open(os.path.join(self.root, scene_path, "meta_info.pkl"), 'rb') as f:
             Ks, RTs = pickle.load(f)
@@ -129,7 +133,6 @@ class Co3DSeqNormalizedDataset(Dataset):
             Rs = Rs[val_frame_list_indicis]
             Ts = Ts[val_frame_list_indicis]
 
-
         # no predefined sampled ids
         max_retry = 5
         sampled_frame_ids = self.sampled_frame_ids
@@ -143,8 +146,9 @@ class Co3DSeqNormalizedDataset(Dataset):
                     sampled_id = np.random.randint(0, len(frame_ids))
                     mask = plt.imread(os.path.join(mask_dir, f"{frame_ids[sampled_id]}.png"))
                     mask = (mask[..., 0]) > 0.5
-                    if np.sum(mask) != 0:
-                        valid = True
+                    # if np.sum(mask) != 0:
+                    #     valid = True
+                    valid = True
                     n_try += 1
 
                 sampled_frame_ids.append(sampled_id)
@@ -176,11 +180,23 @@ class Co3DSeqNormalizedDataset(Dataset):
         cam_transform_pytorch3d = get_cam_transform(sampled_R_pytorch3d, sampled_T_pytorch3d)
         rel_cam_transform_pytorch3d = get_relative_cam_transform(cam_transform_pytorch3d[:1], cam_transform_pytorch3d[1:])
         identity = torch.eye(4)[None]
+
+        if (torch.abs(cam_transform_pytorch3d) > 20).sum() or (torch.abs(rel_cam_transform_pytorch3d) > 20).sum():
+            print("=========================")
+            print(scene_path)
+            print(cam_transform_pytorch3d)
+            print(rel_cam_transform_pytorch3d)
+            print("Resampling instance ...")
+            return self.__getitem__(random.randint(0, self.__len__() - 1))
+        
+        cam_transform_pytorch3d = torch.clamp(cam_transform_pytorch3d, min=-20, max=20)
+        rel_cam_transform_pytorch3d = torch.clamp(rel_cam_transform_pytorch3d, min=-20, max=20)
         new_cam_transform_pytorch3d = torch.cat([
             identity, 
             transform_relative_pose(identity, rel_cam_transform_pytorch3d)
         ], dim=0)
         rel_origin_transform_pytorch3d = get_relative_cam_transform(identity, cam_transform_pytorch3d[:1])[0]
+
 
         # new_verts = (rel_origin_transform_opencv[:3, :3] @ verts.T).T + rel_origin_transform_opencv[3, :3]
         verts = pytorch3d.transforms.transform3d.Transform3d(
@@ -230,7 +246,8 @@ class Co3DSeqNormalizedDataset(Dataset):
             # "verts": verts,
             "R_pytorch3d": sampled_R_pytorch3d,
             "T_pytorch3d": sampled_T_pytorch3d,
-            "center": center
+            "center": center,
+            "category": category
         }
         return {"data": data}
     

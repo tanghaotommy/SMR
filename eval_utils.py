@@ -27,6 +27,13 @@ def compute_pose_metric(pred, gt):
     return theta, t_error
 
 
+def compute_angular_error(rotation1, rotation2):
+    R_rel = rotation1.T @ rotation2
+    tr = (np.trace(R_rel) - 1) / 2
+    theta = np.arccos(tr.clip(-1, 1))
+    return theta * 180 / np.pi
+
+
 def permute_clips(clips, gt_poses, nvs_extr, canonical_id, clips_only=False, return_permutation=False):
     # clips in shape [1,t,c,h,w]
     t = clips.shape[1]
