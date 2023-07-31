@@ -404,6 +404,7 @@ class SelfAttention(nn.Module):
         mlp_ratio: int = 1,
         num_qk_channels: Optional[int] = None,
         num_v_channels: Optional[int] = None,
+        num_output_channels: Optional[int] = None,
         dropout: float = 0.0,
     ):
         """Multi-head self-attention (see `MultiHeadAttention` and for details)."""
@@ -415,6 +416,7 @@ class SelfAttention(nn.Module):
             num_kv_input_channels=num_channels,
             num_qk_channels=num_qk_channels,
             num_v_channels=num_v_channels,
+            num_output_channels=num_output_channels,
             dropout=dropout,
         )
         self.mlp = MLP_attention(num_channels=num_channels, widening_factor=mlp_ratio)

@@ -128,9 +128,11 @@ class Backbone(BackboneBase):
         ckpt_path=None,
         pretrained=True,
         input_dim=3,
+        norm_layer=None,
     ):
         if "resnet" in name:
-            norm_layer = FrozenBatchNorm2d if freeze_bn else nn.BatchNorm2d
+            if norm_layer is None:
+                norm_layer = FrozenBatchNorm2d if freeze_bn else nn.BatchNorm2d
             # here is different from the original DETR because we use feature from block3
             backbone = getattr(resnet_module, name)(
                 replace_stride_with_dilation=[False, dilation, False],

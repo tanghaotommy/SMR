@@ -47,19 +47,19 @@ export CUDA_HOME=/public/apps/cuda/11.3/
 
 cd /checkpoint/haotang/dev/SMR/
 
-export DATA_ROOT=/checkpoint/haotang/data/co3d_normalized
-# export DATA_ROOT=/datasets01/co3d/081922
+export DATA_ROOT=/checkpoint/haotang/data/co3d_v2_normalized_128
 # export DATA_ROOT=/checkpoint/haotang/data/shapenet_multiview_10
 # export DATA_ROOT=/checkpoint/haotang/data/CUB_Data
 export CUDA_LAUNCH_BLOCKING=1.
-srun  python train_multiview.py --batchSize 24 \
-                    --batchSize 32 \
+export NCCL_LL_THRESHOLD=0
+srun  python train_multiview.py --batchSize 32 \
+                    --n_gpu_per_node 8 \
                     --lr 0.0001 \
                     --niter 9000 \
                     --dataset co3d_seq \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/MultiViewFormer/normalized_co3d_toyplane_and_teddybear_9000_iters_rgb_recenter_masked_image_loss_reg01 \
+                    --outf ./log/MultiViewFormer/normalized_co3d_30cat_adam_ddp_lr0001_fixed_modelbug_bs32_try4 \
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \
@@ -69,5 +69,5 @@ srun  python train_multiview.py --batchSize 24 \
                     --lambda_ic 0.1 \
                     --lambda_lc 0.001 \
                     --visualization_epoch 10 \
-                    --model MeshFormer
-                    # --amodal 2
+                    --model MeshFormer \
+                    --ddp

@@ -264,3 +264,25 @@ def compute_rotation_matrix_from_ortho6d(ortho6d):
     z = z.view(-1,3,1)
     matrix = torch.cat((x,y,z), 2) #batch*3*3
     return matrix
+
+
+def kaolin2opencv(R, T):
+    opencv_to_kaolin = torch.diag(torch.FloatTensor([1,-1,-1])).float().to(R.device)
+    RT_kaolin = torch.cat([R.transpose(1, 2), T.unsqueeze(-1)], dim=-1)
+    RT_opencv =  opencv_to_kaolin @ RT_kaolin
+    R_opencv = RT_opencv[:, :3, :3]
+    T_opencv = RT_opencv[:, :3, 3]
+
+    return R_opencv, T_opencv
+
+
+def project_points_torch(pts, RT, K):
+    pts = pts @ RT[:, :,:3].transpose(1, 2) + RT[:, :,3:].transpose(1, 2)
+    pts = pts @ K.transpose(1, 2)
+    dpt = pts[:, :,2]
+    mask0 = (torch.abs(dpt)<1e-4) & (torch.abs(dpt)>0)
+    if torch.sum(mask0)>0: dpt[mask0]=1e-4
+    mask1 = (torch.abs(dpt) > -1e-4) & (torch.abs(dpt) < 0)
+    if torch.sum(mask1)>0: dpt[mask1]=-1e-4
+    pts2d = pts[:, :,:2] / dpt[:, :, None]
+    return pts2d, dpt

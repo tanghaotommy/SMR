@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import gzip
@@ -48,6 +49,7 @@ class Co3DSeqNormalizedDataset(Dataset):
 
             self.scene_paths.extend(cur_scene_paths)
 
+        # self.scene_paths = self.scene_paths[:15000]
         self.sampled_frame_ids = None
 
         # self.scene_paths = ["toyplane/403_52953_103399"] * len(self.scene_paths)
@@ -181,12 +183,19 @@ class Co3DSeqNormalizedDataset(Dataset):
         rel_cam_transform_pytorch3d = get_relative_cam_transform(cam_transform_pytorch3d[:1], cam_transform_pytorch3d[1:])
         identity = torch.eye(4)[None]
 
+        if torch.isnan(sampled_R_pytorch3d).sum() > 0:
+            # print("=========================sampled_R_pytorch3d isnan")
+            # print(scene_path)
+            # print(sampled_R_pytorch3d)
+            # print("Resampling instance ...")
+            return self.__getitem__(random.randint(0, self.__len__() - 1))
+
         if (torch.abs(cam_transform_pytorch3d) > 20).sum() or (torch.abs(rel_cam_transform_pytorch3d) > 20).sum():
-            print("=========================")
-            print(scene_path)
-            print(cam_transform_pytorch3d)
-            print(rel_cam_transform_pytorch3d)
-            print("Resampling instance ...")
+            # print("=========================")
+            # print(scene_path)
+            # print(cam_transform_pytorch3d)
+            # print(rel_cam_transform_pytorch3d)
+            # print("Resampling instance ...")
             return self.__getitem__(random.randint(0, self.__len__() - 1))
         
         cam_transform_pytorch3d = torch.clamp(cam_transform_pytorch3d, min=-20, max=20)
@@ -198,6 +207,15 @@ class Co3DSeqNormalizedDataset(Dataset):
         rel_origin_transform_pytorch3d = get_relative_cam_transform(identity, cam_transform_pytorch3d[:1])[0]
 
 
+        # if torch.isnan(new_cam_transform_pytorch3d).sum() > 0:
+        #     print("=========================new_cam_transform_pytorch3d_T_isnan")
+        #     print(sampled_R_pytorch3d)
+        #     print(scene_path)
+        #     print(new_cam_transform_pytorch3d)
+        #     print(cam_transform_pytorch3d)
+        #     # print("Resampling instance ...")
+        #     # return self.__getitem__(random.randint(0, self.__len__() - 1))
+
         # new_verts = (rel_origin_transform_opencv[:3, :3] @ verts.T).T + rel_origin_transform_opencv[3, :3]
         verts = pytorch3d.transforms.transform3d.Transform3d(
             matrix=rel_origin_transform_pytorch3d
@@ -205,9 +223,6 @@ class Co3DSeqNormalizedDataset(Dataset):
         sampled_R_pytorch3d = new_cam_transform_pytorch3d[:, :3, :3]
         sampled_T_pytorch3d = new_cam_transform_pytorch3d[:, 3, :3]
         center = torch.mean(verts, dim=0).clone()
-
-
-
 
         for R, T in zip(sampled_R_pytorch3d, sampled_T_pytorch3d):
             R, T = pytorch3d_to_kaolin(R, T)
@@ -228,6 +243,15 @@ class Co3DSeqNormalizedDataset(Dataset):
         sampled_focal_length = torch.stack(sampled_focal_length)
         absolute_poses = get_cam_transform(sampled_R, sampled_T)
         relative_posees = get_relative_cam_transform(absolute_poses[:1], absolute_poses[1:])
+
+        # if torch.isnan(sampled_T).sum() > 0:
+        #     print("=========================sampled_T_isnan")
+        #     print(absolute_poses)
+        #     print(scene_path)
+        #     print(new_cam_transform_pytorch3d)
+        #     print(cam_transform_pytorch3d)
+        #     # print("Resampling instance ...")
+        #     # return self.__getitem__(random.randint(0, self.__len__() - 1))
         
         cam_quat = mat2quat(relative_posees)
 

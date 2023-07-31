@@ -109,8 +109,12 @@ class PoseEstimator2D(nn.Module):
 
 
 class PoseEstimator2DFeat(nn.Module):
-    def __init__(self):
+    def __init__(self, norm_layer=None):
         super(PoseEstimator2DFeat, self).__init__()
+        if norm_layer is None:
+            conv_norm_layer = nn.BatchNorm2d
+        else:
+            conv_norm_layer = norm_layer
 
         self.cross_attn_layers = 3
         self.self_attn_layers = 3
@@ -126,10 +130,10 @@ class PoseEstimator2DFeat(nn.Module):
 
         self.conv = nn.Sequential(*[
             nn.Conv2d(256, 256, 3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            conv_norm_layer(256),
             nn.LeakyReLU(inplace=True),
             nn.Conv2d(256, 512, 3, padding=1, stride=2),
-            nn.BatchNorm2d(512),
+            conv_norm_layer(512),
             nn.LeakyReLU(inplace=True),
             nn.Conv2d(512, 512, 3, padding=1, stride=2),
             nn.BatchNorm2d(512),
@@ -141,7 +145,7 @@ class PoseEstimator2DFeat(nn.Module):
 
         self.out = nn.Sequential(*[
             nn.Linear(1024, 256),
-            nn.BatchNorm1d(256),
+            nn.BatchNorm1d(256) if norm_layer is None else nn.LayerNorm(256),
             nn.LeakyReLU(),
             nn.Linear(256, 7)
         ])
@@ -180,6 +184,90 @@ class PoseEstimator2DFeat(nn.Module):
             pred = self.out(feat)         # [b*(t-1),7]
             #pred = rearrange(pred, '(b t) c -> b t c', t=T-1)
             return pred
+
+
+# class PoseEstimator2DFeat(nn.Module):
+#     def __init__(self, norm_layer=None):
+#         super(PoseEstimator2DFeat, self).__init__()
+#         if norm_layer is None:
+#             conv_norm_layer = nn.BatchNorm2d
+#         else:
+#             conv_norm_layer = norm_layer
+
+#         self.cross_attn_layers = 3
+#         self.self_attn_layers = 3
+
+#         self.cross_attn_blks = nn.ModuleList([
+#             CrossAttention(num_heads=4, num_q_input_channels=256, num_kv_input_channels=256,mlp_ratio=4)
+#             for i in range(self.cross_attn_layers)
+#         ])
+#         self.self_attn_blks = nn.ModuleList([
+#             SelfAttention(num_heads=4, num_channels=256, mlp_ratio=4)
+#             for i in range(self.self_attn_layers)
+#         ])
+
+#         self.conv = nn.Sequential(*[
+#             nn.Conv2d(256, 256, 3, padding=1, stride=2),
+#             conv_norm_layer(256),
+#             nn.LeakyReLU(inplace=True),
+#             nn.Conv2d(256, 512, 3, padding=1, stride=2),
+#             conv_norm_layer(512),
+#             nn.LeakyReLU(inplace=True),
+#             nn.Conv2d(512, 512, 3, padding=1, stride=2),
+#             nn.BatchNorm2d(512),
+#             nn.LeakyReLU(inplace=True),
+#             nn.Conv2d(512, 1024, 3, padding=1, stride=2),
+#             nn.BatchNorm2d(1024),
+#             nn.LeakyReLU(inplace=True),
+#         ])
+
+#         self.out = nn.Sequential(*[
+#             nn.Linear(1024, 256),
+#             nn.BatchNorm1d(256) if norm_layer is None else nn.LayerNorm(256),
+#             nn.LeakyReLU(),
+#             nn.Linear(256, 7)
+#         ])
+
+#         pos_emb = 0.05 * torch.from_numpy(model_utils.get_2d_sincos_pos_embed(256, [8, 8], cls_token=False)).float()
+#         self.pos_emb = nn.Parameter(pos_emb.unsqueeze(0))
+
+
+#     def forward(self, feat, return_features=False):
+#         '''
+#         x in shape [B,T,C,H,W] 2D images
+#         '''
+#         B, T, C, H, W = feat.shape
+#         H2, W2 = feat.shape[-2:]
+
+#         feat_canonical = feat[:,0]  # [b,256,16,16]
+#         feat = feat[:,1:]           # [b,t-1,256,16,16]
+
+#         feat_canonical = rearrange(feat_canonical, 'b c h w -> b (h w) c')     # [b,16*16,256]
+#         feat = rearrange(feat, 'b t c h w -> b t (h w) c')      # [b,t-1,16*16,256]
+#         feat_canonical = feat_canonical + self.pos_emb.to(feat.device)
+#         feat = feat + self.pos_emb.unsqueeze(1).to(feat.device)
+#         feat = rearrange(feat, 'b t n c -> b (t n) c')          # [b, (t-1)*16*16,256]
+
+#         for cross_attn_blk, self_attn_blk in zip(self.cross_attn_blks, self.self_attn_blks):
+#             feat = cross_attn_blk(x_q=feat, x_k=feat_canonical, x_v=feat_canonical, residual=feat)
+#             feat = self_attn_blk(feat)
+
+#         feat = rearrange(feat, 'b (t n) c -> (b t) c n', t=T-1)   # [b,t-1,256,16*16]
+#         feat = rearrange(feat, 'b c (h w)  -> b c h w', h=H)   # [b,t-1,256,16*16]
+#         feat = F.adaptive_avg_pool2d(feat, (2, 2)).squeeze()
+#         feat = rearrange(feat, 'b c h w  -> b (c h w)')
+#         pred = self.out(feat)
+
+#         return pred
+#         # feat = rearrange(feat, 'b t c (h w) -> (b t) c h w', h=H2, w=W2)  # [b*(t-1),256,16,16]
+
+#         # feat = self.conv(feat).squeeze()                  # [b*(t-1),1024]
+#         # if return_features:
+#         #     return feat
+#         # else:
+#         #     pred = self.out(feat)         # [b*(t-1),7]
+#         #     #pred = rearrange(pred, '(b t) c -> b t c', t=T-1)
+#         #     return pred
 
 
 class FPN(nn.Module):

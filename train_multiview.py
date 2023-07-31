@@ -45,11 +45,14 @@ from models.meshformer import MultiViewMeshFormer
 from eval_utils import compute_pose_metric
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import matplotlib.pyplot as plt
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--outf', help='folder to output images and model checkpoints')
+parser.add_argument('--pretrained_path', default=None, help='folder to pretrained output images and model checkpoints')
 parser.add_argument('--dataset', help='dataset name', default='bird')
 parser.add_argument('--dataroot', help='path to dataset root dir')
 parser.add_argument('--template_path', default='template/sphere.obj', help='template mesh path')
@@ -80,16 +83,18 @@ parser.add_argument('--model', help='model name', default='SMR')
 parser.add_argument('--visualization_epoch', type=int, default=1)
 parser.add_argument('--val_epoch', type=int, default=10)
 parser.add_argument('--ddp', action='store_true', default=False, help='whether use distributedparallel')
+parser.add_argument('--refine_pose', action='store_true', default=False, help='whether refine initial pose')
+parser.add_argument('--norm_layer', default=None, help='which normalization to use')
 parser.add_argument('--n_gpu_per_node', type=int, default=2, help='number of GPUs per node')
 
 opt = parser.parse_args()
 print(opt)
 
-if opt.manualSeed is None:
-    opt.manualSeed = random.randint(1, 10000)
-# print("Random Seed: ", opt.manualSeed)
-random.seed(opt.manualSeed)
-torch.manual_seed(opt.manualSeed)
+# if opt.manualSeed is None:
+#     opt.manualSeed = random.randint(1, 10000)
+# # print("Random Seed: ", opt.manualSeed)
+# random.seed(opt.manualSeed)
+# torch.manual_seed(opt.manualSeed)
 
 TRAINING_CATEGORIES = [
     "apple",
@@ -350,12 +355,28 @@ class DiffRender(object):
 
         texcolor = texture_mapping(texcoord, textures, mode='bilinear')
         coef = spherical_harmonic_lighting(imnormal, lights)
+        if torch.isnan(coef).sum():
+            print("===========coef============isnan")
+        if torch.isnan(texcolor).sum():
+            print("===========texcolor============isnan")
+        if torch.isnan(texmask).sum():
+            print("===========texmask============isnan")
         image = texcolor * texmask * coef.unsqueeze(-1) + torch.ones_like(texcolor) * (1 - texmask)
+        if torch.isnan(image).sum():
+            print("===========image============isnan")
         image = torch.clamp(image, 0, 1)
         render_img = image
         
         render_silhouttes = soft_mask[..., None]
         rgbs = torch.cat([render_img, render_silhouttes], axis=-1).permute(0, 3, 1, 2)
+        if torch.isnan(render_silhouttes).sum():
+            print(cam_transform)
+            print(torch.isnan(cam_transform).sum())
+            print("===========render_silhouttes============isnan")
+
+        if torch.isnan(rgbs).sum():
+            print("======set rendered rgbs to 0========")
+            rgbs = torch.ones_like(rgbs)
 
         attributes['face_normals'] = face_normals
         attributes['faces_image'] = face_vertices_image.mean(dim=2)
@@ -520,14 +541,15 @@ class AttributeEncoder(nn.Module):
 
 
 class MeshFormerEncoder(nn.Module):
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False, norm_layer=None):
         super(MeshFormerEncoder, self).__init__()
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
         self.use_multi_view_texture = use_multi_view_texture
+        self.refine_pose = refine_pose
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
-        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose)
+        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer)
         if self.use_multi_view_texture:
             self.texture_enc = MultiViewTextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
         else:
@@ -542,7 +564,13 @@ class MeshFormerEncoder(nn.Module):
         input_img = x
 
         # meshformer
-        delta_vertices, cameras, lights, textures, pred_cameras, shape_memory = self.meshformer(input_img, gt_poses, use_gt_pose=use_gt_pose)
+        ret = self.meshformer(input_img, gt_poses, use_gt_pose=use_gt_pose)
+        delta_vertices = ret["delta_vertices"]
+        lights = ret["lights"]
+        textures = ret["textures"]
+        pred_cameras = ret["pred_cameras"]
+        refined_cameras = ret["refined_cameras"]
+        shape_memory = ret["shape_memory"]
 
         # # cameras
         # cameras = self.camera_enc(input_img)
@@ -575,7 +603,8 @@ class MeshFormerEncoder(nn.Module):
             'textures': textures,
             'lights': lights,
             'img_feats': img_feats,
-            'pred_cameras': pred_cameras
+            'pred_cameras': pred_cameras,
+            'refined_cameras': refined_cameras
         }
         return attributes
 
@@ -625,6 +654,379 @@ def weights_init(m):
         m.bias.data.fill_(0)
 
 
+def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloader, summary_writer, mode="Train"):
+    input_key = "original_images"
+    lossR_all = []
+    lossR_reg_all = []
+    lossR_data_all = []
+    lossR_flip_all = []
+    lossR_cam_quat_all = []
+    loss_pose_all = []
+    loss_trans_all = []
+    loss_refined_pose_all = []
+    loss_refined_trans_all = []
+    lossR_refined_cam_quat_all = []
+    rot_error_all = defaultdict(list)
+    rot_gt_all = defaultdict(list)
+    trans_error_all = defaultdict(list)
+    refined_rot_error_all = defaultdict(list)
+    refined_trans_error_all = defaultdict(list)
+
+    for iter, data in enumerate(dataloader):
+        Xa = Variable(data['data']['images']).cuda()
+        # Ea = Variable(data['data']['edge']).cuda()
+        absolute_poses = data['data']['absolute_poses'].cuda()
+        relative_poses = data['data']['relative_poses'].cuda()
+        cam_quat_gt = data['data']['relative_poses_quat'].cuda()
+        focal_length = data['data']['focal_length'].cuda()
+        center = data["data"]["center"].cuda()
+        category = data["data"]["category"]
+        batch_size = Xa.shape[0]
+        num_views = Xa.shape[1]
+
+        Xb = Variable(data['data'][input_key]).cuda()
+        batch_size, num_views, C, H, W = Xb.shape
+
+        # encode real
+        Ae = model(
+            Xb, 
+            {
+                "gt_poses": cam_quat_gt,
+                "center": center,
+                "focal_length": focal_length,
+                "absolute_poses": absolute_poses
+            }, 
+            use_gt_pose=True
+        )
+        if torch.isnan(absolute_poses).sum() > 0:
+            print("=========after model forward, absolute_poses isnan")
+            print(absolute_poses)
+
+        Ae["absolute_poses"] = absolute_poses
+        Ae["focal_length"] = focal_length
+        Ae["center"] = center
+        Ae["num_views"] = num_views
+        Xer, Ae = diffRender.render_w_camera(**Ae)
+
+        for k in range(len(Xer)):
+            d = Xer[k]
+            if torch.isnan(d).sum() > 0:
+                print(k)
+                print("lossR_data=====================")
+                print(focal_length)
+                print(data["data"]["path"][k % num_views][k // num_views])
+                print(d)
+
+        optimizer.zero_grad()
+        lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa.view(batch_size * num_views, C, H, W))
+
+        # mesh regularization
+        lossR_reg = opt.lambda_reg * diffRender.calc_reg_loss(Ae)
+        
+        # overall loss
+        lossR_fake = torch.zeros(1).to(lossR_data.device)
+        lossR_LC = torch.zeros(1).to(lossR_data.device)
+        lossR_IC = torch.zeros(1).to(lossR_data.device)
+
+        device = Xb.device
+        poses_pred = Ae["pred_cameras"]
+        refined_poses_pred = Ae["refined_cameras"]
+        
+        tmp = torch.zeros_like(poses_pred)
+        tmp[:,:4] = F.normalize(poses_pred[:,:4])
+        tmp[:,4:] = poses_pred[:,4:]
+        poses_pred = tmp
+
+        loss = 0.0
+        # Merge the batch_size and num_views dim
+        cam_quat_gt = cam_quat_gt.view(batch_size * (num_views - 1), -1)
+
+        # some gt trans are inf, ignore these entry
+        loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
+        loss_pose = loss_pose[loss_pose < 10].mean()
+        # loss_pose = F.mse_loss(geo_utils.quat2mat(poses_pred)[:, :3, :3], relative_poses.view(batch_size * (num_views - 1), 4, 4)[:, :3, :3], reduction='none')
+        # loss_pose_1 = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
+        # loss_pose_2 = F.mse_loss(geo_utils.quat2mat(poses_pred)[:, :3, :3], relative_poses.view(batch_size * (num_views - 1), 4, 4)[:, :3, :3], reduction='none')
+        # loss_pose_1 = loss_pose_1[loss_pose_1 < 10].mean()
+        # loss_pose_2 = loss_pose_2[loss_pose_2 < 10].mean()
+        # loss_pose = loss_pose_1 + loss_pose_2
+        loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:], reduction='none')
+
+        loss_trans = loss_trans[loss_trans < 10].mean()
+        lossR_cam_quat = loss_pose + loss_trans
+
+        if opt.refine_pose:
+            loss_refined_pose = F.mse_loss(refined_poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
+            loss_refined_trans = F.mse_loss(refined_poses_pred[:,4:], cam_quat_gt[:,4:], reduction='none')
+            loss_refined_pose = loss_refined_pose[loss_refined_pose < 10].mean()
+            loss_refined_trans = loss_refined_trans[loss_refined_trans < 10].mean()
+        else:
+            loss_refined_pose = torch.zeros_like(loss_pose)
+            loss_refined_trans = torch.zeros_like(loss_trans)
+
+        lossR_refined_cam_quat = loss_refined_pose + loss_refined_trans
+
+        # lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat + lossR_refined_cam_quat
+        lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
+
+        rot_error_batch = []
+        rot_error, trans_error = defaultdict(list), defaultdict(list)
+        refined_rot_error, refined_trans_error = defaultdict(list), defaultdict(list)
+        rot_all = defaultdict(list)
+        canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
+        for img_idx in range(len(cam_quat_gt)):
+            b_id = img_idx // (num_views - 1)
+            cat = category[b_id]
+            cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
+                                                                    cam_quat_gt[img_idx].detach().cpu())
+            cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
+                                            canonical.detach().cpu())
+            rot_all[cat].append(cur_rot)
+            rot_error[cat].append(cur_rot_error)
+            rot_error_batch.append(cur_rot_error)
+            trans_error[cat].append(cur_trans_error)
+
+            if opt.refine_pose:
+                cur_rot_error, cur_trans_error = compute_pose_metric(refined_poses_pred[img_idx].detach().cpu(), 
+                                                            cam_quat_gt[img_idx].detach().cpu())
+
+            refined_rot_error[cat].append(cur_rot_error)
+            refined_trans_error[cat].append(cur_trans_error)
+
+        for k in rot_all.keys():
+            rot_error[k] = np.nanmean(rot_error[k])
+            trans_error[k] = np.nanmean(trans_error[k])
+            refined_rot_error[k] = np.nanmean(refined_rot_error[k])
+            refined_trans_error[k] = np.nanmean(refined_trans_error[k])
+            rot_all[k] = np.nanmean(rot_all[k])
+
+        # record result from each iteration
+        lossR_all.append(lossR.item())
+        lossR_reg_all.append(lossR_reg.item())
+        lossR_cam_quat_all.append(lossR_cam_quat.item())
+        lossR_refined_cam_quat_all.append(lossR_refined_cam_quat.item())
+        lossR_data_all.append(lossR_data.item())
+        loss_pose_all.append(loss_pose.item())
+        loss_trans_all.append(loss_trans.item())
+        loss_refined_pose_all.append(loss_refined_pose.item())
+        loss_refined_trans_all.append(loss_refined_trans.item())
+
+        for k in rot_all.keys():
+            rot_error_all[k].append(rot_error[k])
+            rot_gt_all[k].append(rot_all[k])
+            trans_error_all[k].append(trans_error[k])
+            refined_rot_error_all[k].append(refined_rot_error[k])
+            refined_trans_error_all[k].append(refined_trans_error[k])
+
+        # if rank == 0:
+        print('Name: ', opt.outf)
+        print('%d [%s][%d/%d][%d/%d]\n'
+        'lossR: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f refined_loss_pose: %.4f loss_trans: %.4f refined_loss_trans: %.4f'
+        'rot_error: %.4f refined_rot_error: %.4f trans_error: %.4f refined_trans_error: %.4f rot_all: %.4f \n'
+            % (rank, mode, epoch, opt.niter, iter, len(dataloader),
+                lossR.item(), lossR_reg.item(), lossR_data.item(),
+                loss_pose.item(), loss_refined_pose.item(), loss_trans.item(), loss_refined_trans.item(), 
+                np.mean([v for _, v in rot_error.items()]), 
+                np.mean([v for _, v in refined_rot_error.items()]), 
+                np.mean([v for _, v in trans_error.items()]), 
+                np.mean([v for _, v in refined_trans_error.items()]), 
+                np.mean([v for _, v in rot_all.items()]), 
+                )
+        )
+
+        if mode == "Train":
+            optimizer.zero_grad()
+            lossR.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2)
+            optimizer.step()
+
+    ret_dict = {
+        "lossR": lossR_all,
+        "lossR_reg": lossR_reg_all,
+        "lossR_data": lossR_data_all,
+        "lossR_cam_quat": lossR_cam_quat_all,
+        "lossR_refined_cam_quat": lossR_refined_cam_quat_all,
+        "loss_pose": loss_pose_all,
+        "loss_trans": loss_trans_all,
+        "loss_refined_pose": loss_refined_pose_all,
+        "loss_refined_trans": loss_refined_trans_all,
+        "rot_gt": [np.average(v) for _, v in rot_gt_all.items()],
+        "rot_error": [np.average(v) for _, v in rot_error_all.items()],
+        "trans_error": [np.average(v) for _, v in trans_error_all.items()],
+        "refined_rot_error": [np.average(v) for _, v in refined_rot_error_all.items()],
+        "refined_trans_error": [np.average(v) for _, v in refined_trans_error_all.items()],
+    }
+
+    print(f"{rank} total keys {len(ret_dict)}", flush=True)
+    keys = ret_dict.keys()
+    values = [torch.Tensor(ret_dict[k]).mean() for k in ret_dict.keys()]
+    values = torch.Tensor(values).cuda()
+
+    print(f"{rank} synchronize", flush=True)
+    dist.barrier(device_ids=[torch.cuda.current_device()])
+    dist.all_reduce(values, op=dist.ReduceOp.AVG)
+    ret_dict = {k: v.item() for k, v in zip(keys, values)}
+
+    for k in rot_error_all.keys():
+        ret_dict[f"rot_gt_{k}"] = rot_gt_all[k]
+        ret_dict[f"rot_error_{k}"] = rot_error_all[k]
+        ret_dict[f"trans_error_{k}"] = trans_error_all[k]
+        ret_dict[f"refined_rot_error_{k}"] = refined_rot_error_all[k]
+        ret_dict[f"refined_trans_error_{k}"] = refined_trans_error_all[k]
+
+    if rank == 0:
+        print("Writing summary writer...", flush=True)
+        summary_writer.add_scalar(f'{mode}/lr', scheduler.get_last_lr()[0], epoch)
+        for k, v in ret_dict.items():
+            summary_writer.add_scalar(f'{mode}/{k}', np.average(v), epoch)
+
+
+    if epoch % opt.visualization_epoch == 0 and rank == 0 and mode == "Train":
+        num_images = Xa.shape[0]
+        textures = Ae['textures']
+
+        Xa = (Xa * 255).view(batch_size * num_views, C, H, W).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+        Xer = (Xer * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+
+        Xa = torch.tensor(Xa, dtype=torch.float32) / 255.0
+        Xa = Xa.permute(0, 3, 1, 2)
+        Xer = torch.tensor(Xer, dtype=torch.float32) / 255.0
+        Xer = Xer.permute(0, 3, 1, 2)
+
+        # visualize projected points
+        pred_rel_pose = geo_utils.quat2mat(poses_pred)
+        canonical = absolute_poses[0][:1]
+        pred_absolute_pose = geo_utils.transform_relative_pose(canonical, pred_rel_pose).view(batch_size, num_views - 1, 4, 4)
+        pred_absolute_pose = torch.cat([canonical[None].expand(batch_size, -1, -1, -1), pred_absolute_pose], dim=1)
+        pred_absolute_pose = pred_absolute_pose.view(batch_size * num_views, 4, 4)
+
+        R_kaolin = pred_absolute_pose[:, :3, :3]
+        T_kaolin = pred_absolute_pose[:, 3, :3]
+        R_opencv, T_opencv = geo_utils.kaolin2opencv(R_kaolin, T_kaolin)
+        RT_opencv = torch.cat([R_opencv, T_opencv.unsqueeze(-1)], dim=-1)
+        vertices = Ae["vertices"]
+        focal_length = focal_length
+        k = torch.zeros([batch_size, num_views, 3, 3]).to(vertices.device)
+        k[:, :, 0, 0] = focal_length[:, :, 0] * min(W, H) // 2
+        k[:, :, 1, 1] = focal_length[:, :, 1] * min(W, H) // 2
+        k[:, :, 0, 2] = W // 2
+        k[:, :, 1, 2] = H // 2
+        k[:, :, 2, 2] = 1
+        k = k.view(-1, 3, 3)
+
+        projected_pts, dpt = geo_utils.project_points_torch(
+            vertices + center.repeat_interleave(num_views, dim=0).unsqueeze(1), 
+            RT_opencv, 
+            k
+        )    
+        normalized_pts = projected_pts.clone().detach()        
+        normalized_pts[:, :, 0] = normalized_pts[:, :, 0] / W * 2 - 1
+        normalized_pts[:, :, 1] = normalized_pts[:, :, 1] / H * 2 - 1
+
+        rgb_feat = F.grid_sample(Xb.view(batch_size * num_views, C, H, W), normalized_pts.unsqueeze(-2)).squeeze()
+
+        Xb_flat = Xb.view(batch_size*num_views, -1, H, W)
+
+        fig, axs = plt.subplots(len(Xb_flat), 3, figsize=(12, len(Xb_flat) * 4))
+
+        for i in range(len(Xb_flat)):
+            ax = axs[i][0]
+            im = Xb_flat[i, :3].permute(1, 2, 0).detach().cpu()
+            ax.imshow(im)
+            ax.set_title("Input")
+
+            projected_pts_cpu = projected_pts[i].cpu().data
+
+            ax = axs[i][1]
+            im = Xb_flat[i, :3].permute(1, 2, 0).detach().cpu()
+            im = np.ones_like(im)
+            ax.imshow(im)
+            ax.scatter(projected_pts_cpu[:, 0], projected_pts_cpu[:, 1], c=rgb_feat[i][:3].T.cpu().data.numpy(), s=1)
+            ax.set_title(f"Using predicted pose {round(rot_error_batch[i - i // num_views - 1], 2) if i % num_views != 0 else 0}")
+            
+            ax = axs[i][2]
+            im = Xb_flat[i, :3].permute(1, 2, 0).detach().cpu()
+            ax.imshow(im)
+            ax.scatter(projected_pts_cpu[:, 0], projected_pts_cpu[:, 1])
+            ax.set_title("Project mesh to input")
+            
+        plt.savefig('%s/epoch_%03d_Iter_%04d_Xb_projected.jpg' % (opt.outf, epoch, iter))
+
+
+        randperm_a = torch.randperm(batch_size)
+        randperm_b = torch.randperm(batch_size)
+
+
+        vutils.save_image(Xa[randperm_a, :3],
+                '%s/epoch_%03d_Iter_%04d_randperm_Xa.png' % (opt.outf, epoch, iter), normalize=True)
+        vutils.save_image(Xa[randperm_a, :3],
+                '%s/current_randperm_Xa.png' % (opt.outf), normalize=True)
+
+        vutils.save_image(Xa[randperm_b, :3],
+                '%s/epoch_%03d_Iter_%04d_randperm_Xb.png' % (opt.outf, epoch, iter), normalize=True)
+        vutils.save_image(Xa[randperm_b, :3],
+                '%s/current_randperm_Xb.png' % (opt.outf), normalize=True)
+
+        vutils.save_image(Xa[:, :3],
+                '%s/epoch_%03d_Iter_%04d_Xa.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
+        vutils.save_image(Xa[:, :3],
+                '%s/current_Xa.png' % (opt.outf), normalize=True, nrow=num_views)
+        
+        vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
+                '%s/epoch_%03d_Iter_%04d_Xb.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
+        vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
+                '%s/current_Xb.png' % (opt.outf), normalize=True, nrow=num_views)
+
+        vutils.save_image(Xer[:, :3].detach(),
+                '%s/epoch_%03d_Iter_%04d_Xer.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
+        vutils.save_image(Xer[:, :3].detach(),
+                '%s/current_Xer.png' % (opt.outf), normalize=True, nrow=num_views)
+
+
+        vutils.save_image(textures.detach(),
+                '%s/current_textures.png' % (opt.outf), normalize=True)
+
+        l = np.array(range(0, batch_size*num_views, num_views))
+        original = l.copy()
+        Ae = deep_copy(Ae, index=original, detach=True)
+        vertices = Ae['vertices']
+        faces = diffRender.faces
+        textures = Ae['textures']
+        # azimuths = Ae['azimuths']
+        # elevations = Ae['elevations']
+        # distances = Ae['distances']
+        lights = Ae['lights']
+
+        texure_maps = to_pil_image(textures[0].detach().cpu())
+        texure_maps.save('%s/current_mesh_recon.png' % (opt.outf), 'PNG')
+        texure_maps.save('%s/epoch_%03d_mesh_recon.png' % (opt.outf, epoch), 'PNG')
+
+        tri_mesh = trimesh.Trimesh(vertices[0].detach().cpu().numpy(), faces.detach().cpu().numpy())
+        tri_mesh.export('%s/current_mesh_recon.obj' % opt.outf)
+        tri_mesh.export('%s/epoch_%03d_mesh_recon.obj' % (opt.outf, epoch))
+
+        rotate_path = os.path.join(opt.outf, 'epoch_%03d_rotation.gif' % epoch)
+        writer = imageio.get_writer(rotate_path, mode='I')
+        loop = tqdm.tqdm(list(range(-int(opt.azi_scope/2), int(opt.azi_scope/2), 10)))
+        loop.set_description('Drawing Dib_Renderer SphericalHarmonics')
+        for delta_azimuth in loop:
+            Ae['azimuths'] = - torch.tensor([delta_azimuth], dtype=torch.float32).repeat(batch_size).cuda()
+            Ae['elevations'] = torch.zeros_like(Ae['azimuths']) + 30
+            Ae['distances'] = torch.zeros_like(Ae['azimuths']) + 2.7
+            predictions, _ = diffRender.render(**Ae)
+            predictions = predictions[:, :3]
+            image = vutils.make_grid(predictions)
+            image = image.permute(1, 2, 0).detach().cpu().numpy()
+            image = (image * 255.0).astype(np.uint8)
+            writer.append_data(image)
+        writer.close()
+        current_rotate_path = os.path.join(opt.outf, 'current_rotation.gif')
+        shutil.copyfile(rotate_path, current_rotate_path)
+
+
+    return ret_dict
+
+
 def train_main(rank, size):
     device = torch.device("cuda:{}".format(rank))
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{rank}"
@@ -655,15 +1057,15 @@ def train_main(rank, size):
         raise NotImplementedError
     
     if opt.ddp:
-        training_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, rank=rank, shuffle=True)
+        training_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, rank=rank, shuffle=True, drop_last=True)
         test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, rank=rank, shuffle=False)
     else:
         training_sampler = test_sampler = None
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batchSize, sampler=training_sampler,
-                                            shuffle=None if opt.ddp else True, drop_last=True, pin_memory=True, num_workers=int(opt.workers))
+                                            shuffle=None if opt.ddp else True, drop_last=False if not opt.ddp else True, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batchSize, sampler=test_sampler,
-                                            shuffle=None if opt.ddp else False, pin_memory=True, num_workers=int(opt.workers))
+                                            shuffle=None if opt.ddp else False, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True)
 
     print(f"Rank {rank}, dataset: {len(train_dataset)}, dataloader: {len(train_dataloader)}")
 
@@ -676,16 +1078,24 @@ def train_main(rank, size):
                                 azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range, 
                                 nc=4, nk=opt.nk, nf=opt.nf)
     elif opt.model == "MeshFormer":
+        if opt.norm_layer == "InstanceNorm2d":
+            norm_layer = nn.InstanceNorm2d
+        elif opt.norm_layer is None:
+            norm_layer = None
+        else:
+            raise NotImplementedError
+
         netE = MeshFormerEncoder(num_vertices=diffRender.num_vertices, vertices_init=diffRender.vertices_init, 
                                 azi_scope=opt.azi_scope, elev_range=opt.elev_range, dist_range=opt.dist_range,
-                                nc=4, nk=opt.nk, nf=opt.nf, refine_pose=False)
+                                nc=4, nk=opt.nk, nf=opt.nf, refine_pose=opt.refine_pose, norm_layer=norm_layer)
     else:
         raise NotImplementedError
     
     netE = netE.cuda()
+    netE = DDP(netE, find_unused_parameters=True)
 
     # setup optimizer
-    optimizerE = optim.AdamW(list(netE.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
+    optimizerE = optim.Adam(list(netE.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
 
     # setup learning rate scheduler
     schedulerE = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerE, T_max=opt.niter, eta_min=1e-6)
@@ -694,6 +1104,19 @@ def train_main(rank, size):
     # if resume is True, restore from latest_ckpt.path
     start_iter = 0
     start_epoch = 0
+
+    if opt.pretrained_path is not None:
+        if rank == 0:
+            resume_path = os.path.join(opt.pretrained_path, 'ckpts/latest_ckpt.pth')
+            print("=> loading checkpoint '{}'".format(resume_path))
+            # Map model to be loaded to specified single gpu.
+            checkpoint = torch.load(resume_path)
+            start_iter = 0
+            netE.load_state_dict(checkpoint['netE'], strict=False)
+
+            print("=> loaded pretrained checkpoint '{}' (epoch {})"
+                .format(resume_path, checkpoint['epoch']))
+
     if opt.resume:
         resume_path = os.path.join(opt.outf, 'ckpts/latest_ckpt.pth')
         if rank == 0:
@@ -725,367 +1148,14 @@ def train_main(rank, size):
         os.makedirs(ckpt_dir, exist_ok=True)
 
         summary_writer = SummaryWriter(os.path.join(opt.outf + "/logs"))
+    else: 
+        summary_writer = None
 
     for epoch in range(start_epoch, opt.niter):
-        lossR_all = []
-        lossR_reg_all = []
-        lossR_data_all = []
-        lossR_flip_all = []
-        lossR_cam_quat_all = []
-        loss_pose_all = []
-        loss_trans_all = []
-        rot_error_all = defaultdict(list)
-        rot_gt_all = defaultdict(list)
-        trans_error_all = defaultdict(list)
-        input_key = "original_images"
-        for iter, data in enumerate(train_dataloader):
-            with Timer("Elapsed time in update: %f"):
-                ############################
-                # (1) Update D network
-                ###########################
-                Xa = Variable(data['data']['images']).cuda()
-                # Ea = Variable(data['data']['edge']).cuda()
-                absolute_poses = data['data']['absolute_poses'].cuda()
-                relative_poses = data['data']['relative_poses'].cuda()
-                cam_quat_gt = data['data']['relative_poses_quat'].cuda()
-                focal_length = data['data']['focal_length'].cuda()
-                center = data["data"]["center"].cuda()
-                category = data["data"]["category"]
-                batch_size = Xa.shape[0]
-                num_views = Xa.shape[1]
-
-                if opt.amodal:
-                    # Random mask Xa to simulate occulusion
-                    Xb = Variable(data['data']['images']).cuda()
-                    mask = Xb[:, -1, :, :]
-                    rgb = Xb[:, :3, :, :]
-                    for i, (m, r) in enumerate(zip(mask, rgb)):
-                        y, x = torch.where(m)
-                        # print(len(y), len(x))
-                        if len(y) == 0 or len(x) == 0:
-                            continue
-                        ymin, ymax = y.min(), y.max()
-                        xmin, xmax = x.min(), x.max()
-                        h = ymax - ymin
-                        w = xmax - xmin
-                        s_x, s_h = random.randint(w // 2, w), random.randint(h // 2, h)
-
-                        # only do mask half of the time
-                        if random.uniform(0, 1) < 0.5:
-                            if random.uniform(0, 1) < 0.5:
-                                # mask according to x
-                                # print(s_x, w / 2)
-                                if s_x > w / 2:
-                                    m[:, xmin + s_x:] = 0
-                                    r[:, :, xmin + s_x:] = 1
-                                else:
-                                    m[:, :xmin + s_x] = 0
-                                    r[:, :, :xmin + s_x] = 1
-                            else:
-                                # mask according to y
-                                # print(s_h, h / 2)
-                                if s_h > h / 2:
-                                    m[ymin + s_h:, :] = 0
-                                    r[:, ymin + s_h:, :] = 1
-                                else:
-                                    m[:ymin + s_h, :] = 0
-                                    r[:, :ymin + s_h, :] = 1
-
-                        # print(opt.amodal)
-                        if opt.amodal == 2:
-                            yy, xx = np.where(m.cpu().numpy())
-                            ymin, ymax = yy.min(), yy.max()
-                            xmin, xmax = xx.min(), xx.max()
-
-                            c_new = [(xmax + xmin) // 2, (ymin + ymax) // 2]
-                            c_old = [opt.imageSize // 2, opt.imageSize // 2]
-                            translate = np.array(c_old) - np.array(c_new)
-
-                            translated_Xb = torchvision.transforms.functional.affine(Xb[i], 0, translate.tolist(), 1, 0)
-                            Xb[i][:3] = translated_Xb[:3, :, :] * translated_Xb[[3], :, :] + torch.ones_like(translated_Xb[:3, :, :]) * (1 - translated_Xb[[3], :, :])
-                            Xb[i][-1] = translated_Xb[-1]
-
-                            translated_Xa = torchvision.transforms.functional.affine(Xa[i], 0, translate.tolist(), 1, 0)
-                            Xa[i][:3] = translated_Xa[:3, :, :] * translated_Xa[[3], :, :] + torch.ones_like(translated_Xa[:3, :, :]) * (1 - translated_Xa[[3], :, :])
-                            Xa[i][-1] = translated_Xa[-1]
-
-                else:
-                    Xb = Variable(data['data'][input_key]).cuda()
-
-                batch_size, num_views, C, H, W = Xb.shape
-                # sample views from each object for cross-instance loss
-
-
-                # encode real
-                Ae = netE(Xb, cam_quat_gt, use_gt_pose=True)
-                Ae["absolute_poses"] = absolute_poses
-                Ae["focal_length"] = focal_length
-                Ae["center"] = center
-                Ae["num_views"] = num_views
-                Xer, Ae = diffRender.render_w_camera(**Ae)
-
-                # Get the first view for each object
-                l = np.array(range(0, batch_size*num_views, num_views))
-                original = l.copy()
-                np.random.shuffle(l)
-                rand_a = l.copy()
-                np.random.shuffle(l)
-                rand_b = l.copy()
-                Aa = deep_copy(Ae, rand_a)
-                Ab = deep_copy(Ae, rand_b)
-                Ai = {}
-
-                # # linearly interpolate 3D attributes
-                # if opt.lambda_ic > 0.0:
-                #     # camera interpolation
-                #     alpha_camera = torch.empty((batch_size), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                #     Ai['azimuths'] = - torch.empty((batch_size), dtype=torch.float32).uniform_(-opt.azi_scope/2, opt.azi_scope/2).cuda()
-                #     Ai['elevations'] = alpha_camera * Aa['elevations'] + (1-alpha_camera) * Ab['elevations']
-                #     Ai['distances'] = alpha_camera * Aa['distances'] + (1-alpha_camera) * Ab['distances']
-
-                #     # shape interpolation
-                #     alpha_shape = torch.empty((batch_size, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                #     Ai['vertices'] = alpha_shape * Aa['vertices'] + (1-alpha_shape) * Ab['vertices']
-                #     Ai['delta_vertices'] = alpha_shape * Aa['delta_vertices'] + (1-alpha_shape) * Ab['delta_vertices']
-
-                #     # texture interpolation
-                #     alpha_texture = torch.empty((batch_size, 1, 1, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                #     Ai['textures'] = alpha_texture * Aa['textures'] + (1.0 - alpha_texture) * Ab['textures']
-
-                #     # light interpolation
-                #     alpha_light = torch.empty((batch_size, 1), dtype=torch.float32).uniform_(0.0, 1.0).cuda()
-                #     Ai['lights'] = alpha_light * Aa['lights'] + (1.0 - alpha_light) * Ab['lights']
-                # else:
-                #     Ai = Ae
-
-                # # interpolated 3D attributes render images, and update Ai
-                # Xir, Ai = diffRender.render(**Ai)
-                # # predicted 3D attributes from above render images 
-                # Aire = netE(Xir.detach().clone().unsqueeze(1))
-                # # render again to update predicted 3D Aire 
-                # _, Aire = diffRender.render(**Aire)
-
-                # # discriminate loss
-                # lossD_real = opt.lambda_gan * (-netD(Xa.detach().clone().view(batch_size * num_views, C, H, W)[original]).mean())
-                # lossD_fake = opt.lambda_gan * (netD(Xer.detach().clone()[original]).mean() + \
-                #                             netD(Xir.detach().clone()).mean()) / 2.0
-
-                # # WGAN-GP
-                # lossD_gp = 10.0 * opt.lambda_gan * (compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xer[original].data) + \
-                #                             compute_gradient_penalty(netD, Xa.data.view(batch_size * num_views, C, H, W)[original], Xir.data)) / 2.0
-
-                # lossD = lossD_real + lossD_fake + lossD_gp
-                # lossD.backward()
-                # optimizerD.step()
-
-                ############################
-                # (2) Update G network
-                ###########################
-                optimizerE.zero_grad()
-                # GAN loss
-                # lossR_fake = opt.lambda_gan * (-netD(Xer[original]).mean() - netD(Xir).mean()) / 2.0
-                lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa.view(batch_size * num_views, C, H, W))
-
-                # mesh regularization
-                lossR_reg = opt.lambda_reg * diffRender.calc_reg_loss(Ae)
-                # lossR_flip = 0.002 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai))
-                lossR_flip = 0.1 * diffRender.recon_flip(Ae)
-                # lossR_flip = torch.zeros_like(lossR_reg)
-
-                # # interpolated cycle consistency
-                # loss_cam, loss_shape, loss_texture, loss_light = diffRender.recon_att(Aire, deep_copy(Ai, detach=True))
-                # lossR_IC = opt.lambda_ic * (loss_cam + loss_shape + loss_texture + loss_light)
-
-                # # landmark consistency
-                # Le = Ae['faces_image'][original]
-                # Li = Aire['faces_image']
-                # Fe = Ae['img_feats'][original]
-                # Fi = Aire['img_feats']
-                # Ve = Ae['visiable_faces'][original]
-                # Vi = Aire['visiable_faces']
-                # lossR_LC = opt.lambda_lc * (netL(Fe, Le, Ve).mean() + netL(Fi, Li, Vi).mean())
-                
-                # overall loss
-                lossR_fake = torch.zeros(1).to(lossR_data.device)
-                lossR_LC = torch.zeros(1).to(lossR_data.device)
-                lossR_IC = torch.zeros(1).to(lossR_data.device)
-
-                device = Xb.device
-                poses_pred = Ae["pred_cameras"]
-                
-                tmp = torch.zeros_like(poses_pred)
-                tmp[:,:4] = F.normalize(poses_pred[:,:4])
-                tmp[:,4:] = poses_pred[:,4:]
-                poses_pred = tmp
-
-                loss = 0.0
-                # Merge the batch_size and num_views dim
-                cam_quat_gt = cam_quat_gt.view(batch_size * (num_views - 1), -1)
-
-                # some gt trans are inf, ignore these entry
-                loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
-                loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:], reduction='none')
-                loss_pose = loss_pose[loss_pose < 10].mean()
-                loss_trans = loss_trans[loss_trans < 10].mean()
-                lossR_cam_quat = loss_pose + loss_trans
-                # lossR_cam = lossR_cam_quat
-                # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam
-                # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC
-                # lossR = lossR_fake + lossR_reg + lossR_flip  + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
-                lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
-                # lossR = lossR_cam_quat
-                rot_error, trans_error = defaultdict(list), defaultdict(list)
-                rot_all = defaultdict(list)
-                canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
-                for img_idx in range(len(cam_quat_gt)):
-                    b_id = img_idx // (num_views - 1)
-                    cat = category[b_id]
-                    cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
-                                                                         cam_quat_gt[img_idx].detach().cpu())
-                    cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
-                                                    canonical.detach().cpu())
-                    rot_all[cat].append(cur_rot)
-                    rot_error[cat].append(cur_rot_error)
-                    trans_error[cat].append(cur_trans_error)
-
-                for k in rot_all.keys():
-                    rot_error[k] = np.nanmean(rot_error[k])
-                    trans_error[k] = np.nanmean(trans_error[k])
-                    rot_all[k] = np.nanmean(rot_all[k])
-
-                lossR.backward()
-                torch.nn.utils.clip_grad_norm_(netE.parameters(), max_norm=2.0, norm_type=2)
-                optimizerE.step()
-
-                if rank == 0:
-                    print('Name: ', opt.outf)
-                    print('[%d/%d][%d/%d]\n'
-                    'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
-                    'lossR_IC: %.4f rot_error: %.4f trans_error: %.4f rot_all: %.4f \n'
-                        % (epoch, opt.niter, iter, len(train_dataloader),
-                            lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                            loss_pose.item(), loss_trans.item(), lossR_IC.item(), 
-                            np.mean([v for _, v in rot_error.items()]), 
-                            np.mean([v for _, v in trans_error.items()]), 
-                            np.mean([v for _, v in rot_all.items()]), 
-                            )
-                    )
-
-                lossR_all.append(lossR.item())
-                lossR_reg_all.append(lossR_reg.item())
-                lossR_flip_all.append(lossR_flip.item())
-                lossR_cam_quat_all.append(lossR_cam_quat.item())
-                lossR_data_all.append(lossR_data.item())
-                loss_pose_all.append(loss_pose.item())
-                loss_trans_all.append(loss_trans.item())
-
-                for k in rot_all.keys():
-                    rot_error_all[k].append(rot_error[k])
-                    rot_gt_all[k].append(rot_all[k])
-                    trans_error_all[k].append(trans_error[k])
-        schedulerE.step()
-
-        if epoch % 1 == 0 and rank == 0:
-            summary_writer.add_scalar('Train/lr', schedulerE.get_last_lr()[0], epoch)
-            summary_writer.add_scalar('Train/lossR', np.average(lossR_all), epoch)
-            summary_writer.add_scalar('Train/lossR_reg', np.average(lossR_reg_all), epoch)
-            summary_writer.add_scalar('Train/lossR_data', np.average(lossR_data_all), epoch)
-            summary_writer.add_scalar('Train/lossR_flip', np.average(lossR_flip_all), epoch)
-            summary_writer.add_scalar('Train/lossR_cam_quat', np.average(lossR_cam_quat_all), epoch)
-            summary_writer.add_scalar('Train/loss_pose', np.average(loss_pose_all), epoch)
-            summary_writer.add_scalar('Train/loss_trans', np.average(loss_trans_all), epoch)
-            summary_writer.add_scalar(f'Train/rot_gt', np.average([np.average(v) for _, v in rot_gt_all.items()]), epoch)
-            summary_writer.add_scalar(f'Train/rot_error', np.average([np.average(v) for _, v in rot_error_all.items()]), epoch)
-            summary_writer.add_scalar(f'Train/trans_error', np.average([np.average(v) for _, v in trans_error_all.items()]), epoch)
-            
-            for k in rot_error_all.keys():
-                summary_writer.add_scalar(f'Train/rot_gt_{k}', np.average(rot_gt_all[k]), epoch)
-                summary_writer.add_scalar(f'Train/rot_error_{k}', np.average(rot_error_all[k]), epoch)
-                summary_writer.add_scalar(f'Train/trans_error_{k}', np.average(trans_error_all[k]), epoch)
-
-
-        if epoch % opt.visualization_epoch == 0 and rank == 0:
-            num_images = Xa.shape[0]
-            textures = Ae['textures']
-
-            Xa = (Xa * 255).view(batch_size * num_views, C, H, W).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
-            Xer = (Xer * 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
-
-            Xa = torch.tensor(Xa, dtype=torch.float32) / 255.0
-            Xa = Xa.permute(0, 3, 1, 2)
-            Xer = torch.tensor(Xer, dtype=torch.float32) / 255.0
-            Xer = Xer.permute(0, 3, 1, 2)
-
-
-            randperm_a = torch.randperm(batch_size)
-            randperm_b = torch.randperm(batch_size)
-
-            vutils.save_image(Xa[randperm_a, :3],
-                    '%s/epoch_%03d_Iter_%04d_randperm_Xa.png' % (opt.outf, epoch, iter), normalize=True)
-            vutils.save_image(Xa[randperm_a, :3],
-                    '%s/current_randperm_Xa.png' % (opt.outf), normalize=True)
-
-            vutils.save_image(Xa[randperm_b, :3],
-                    '%s/epoch_%03d_Iter_%04d_randperm_Xb.png' % (opt.outf, epoch, iter), normalize=True)
-            vutils.save_image(Xa[randperm_b, :3],
-                    '%s/current_randperm_Xb.png' % (opt.outf), normalize=True)
-
-            vutils.save_image(Xa[:, :3],
-                    '%s/epoch_%03d_Iter_%04d_Xa.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
-            vutils.save_image(Xa[:, :3],
-                    '%s/current_Xa.png' % (opt.outf), normalize=True, nrow=num_views)
-            
-            vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
-                    '%s/epoch_%03d_Iter_%04d_Xb.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
-            vutils.save_image(Xb.view(batch_size * num_views, C, H, W)[:, :3],
-                    '%s/current_Xb.png' % (opt.outf), normalize=True, nrow=num_views)
-
-            vutils.save_image(Xer[:, :3].detach(),
-                    '%s/epoch_%03d_Iter_%04d_Xer.png' % (opt.outf, epoch, iter), normalize=True, nrow=num_views)
-            vutils.save_image(Xer[:, :3].detach(),
-                    '%s/current_Xer.png' % (opt.outf), normalize=True, nrow=num_views)
-
-
-            vutils.save_image(textures.detach(),
-                    '%s/current_textures.png' % (opt.outf), normalize=True)
-
-            # vutils.save_image(Ea.view(batch_size * num_views, 1, H, W).detach(),
-            #         '%s/current_edge.png' % (opt.outf), normalize=True)
-
-            Ae = deep_copy(Ae, index=original, detach=True)
-            vertices = Ae['vertices']
-            faces = diffRender.faces
-            textures = Ae['textures']
-            # azimuths = Ae['azimuths']
-            # elevations = Ae['elevations']
-            # distances = Ae['distances']
-            lights = Ae['lights']
-
-            texure_maps = to_pil_image(textures[0].detach().cpu())
-            texure_maps.save('%s/current_mesh_recon.png' % (opt.outf), 'PNG')
-            texure_maps.save('%s/epoch_%03d_mesh_recon.png' % (opt.outf, epoch), 'PNG')
-
-            tri_mesh = trimesh.Trimesh(vertices[0].detach().cpu().numpy(), faces.detach().cpu().numpy())
-            tri_mesh.export('%s/current_mesh_recon.obj' % opt.outf)
-            tri_mesh.export('%s/epoch_%03d_mesh_recon.obj' % (opt.outf, epoch))
-
-            rotate_path = os.path.join(opt.outf, 'epoch_%03d_rotation.gif' % epoch)
-            writer = imageio.get_writer(rotate_path, mode='I')
-            loop = tqdm.tqdm(list(range(-int(opt.azi_scope/2), int(opt.azi_scope/2), 10)))
-            loop.set_description('Drawing Dib_Renderer SphericalHarmonics')
-            for delta_azimuth in loop:
-                Ae['azimuths'] = - torch.tensor([delta_azimuth], dtype=torch.float32).repeat(batch_size).cuda()
-                Ae['elevations'] = torch.zeros_like(Ae['azimuths']) + 30
-                Ae['distances'] = torch.zeros_like(Ae['azimuths']) + 2.7
-                predictions, _ = diffRender.render(**Ae)
-                predictions = predictions[:, :3]
-                image = vutils.make_grid(predictions)
-                image = image.permute(1, 2, 0).detach().cpu().numpy()
-                image = (image * 255.0).astype(np.uint8)
-                writer.append_data(image)
-            writer.close()
-            current_rotate_path = os.path.join(opt.outf, 'current_rotation.gif')
-            shutil.copyfile(rotate_path, current_rotate_path)
+        if training_sampler is not None:
+            training_sampler.set_epoch(epoch)
+        netE.train()
+        forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, train_dataloader, summary_writer, mode="Train")
 
         if epoch % 2 == 0 and rank == 0:
             epoch_name = os.path.join(ckpt_dir, 'epoch_%05d.pth' % epoch)
@@ -1099,134 +1169,16 @@ def train_main(rank, size):
 
         if epoch % opt.val_epoch == 0 and epoch > 0:
             netE.eval()
-            lossR_all = []
-            lossR_reg_all = []
-            lossR_data_all = []
-            lossR_flip_all = []
-            lossR_cam_quat_all = []
-            loss_pose_all = []
-            loss_trans_all = []
-            rot_error_all = defaultdict(list)
-            rot_gt_all = defaultdict(list)
-            trans_error_all = defaultdict(list)
+            forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, test_dataloader, summary_writer, mode="Val")
 
-            for i, data in tqdm.tqdm(enumerate(test_dataloader)):
-                Xa = Variable(data['data']['images']).cuda()
-                # Ea = Variable(data['data']['edge']).cuda()
-                absolute_poses = data['data']['absolute_poses'].cuda()
-                relative_poses = data['data']['relative_poses'].cuda()
-                cam_quat_gt = data['data']['relative_poses_quat'].cuda()
-                focal_length = data['data']['focal_length'].cuda()
-                center = data["data"]["center"].cuda()
-                category = data["data"]["category"]
-                batch_size = Xa.shape[0]
-                num_views = Xa.shape[1]
-
-                Xb = Variable(data['data'][input_key]).cuda()
-                batch_size, num_views, C, H, W = Xb.shape
-                # sample views from each object for cross-instance loss
+        schedulerE.step()
 
 
-                # encode real
-                Ae = netE(Xb, cam_quat_gt, use_gt_pose=True)
-                Ae["absolute_poses"] = absolute_poses
-                Ae["focal_length"] = focal_length
-                Ae["center"] = center
-                Ae["num_views"] = num_views
-                Xer, Ae = diffRender.render_w_camera(**Ae)
-
-
-                lossR_data = opt.lambda_data * diffRender.recon_data(Xer, Xa.view(batch_size * num_views, C, H, W))
-
-                # mesh regularization
-                lossR_reg = opt.lambda_reg * diffRender.calc_reg_loss(Ae)
-                # lossR_flip = 0.002 * (diffRender.recon_flip(Ae) + diffRender.recon_flip(Ai))
-                lossR_flip = 0.1 * diffRender.recon_flip(Ae)
-
-                poses_pred = Ae["pred_cameras"]
-
-                tmp = torch.zeros_like(poses_pred)
-                tmp[:,:4] = F.normalize(poses_pred[:,:4])
-                tmp[:,4:] = poses_pred[:,4:]
-                poses_pred = tmp
-
-                cam_quat_gt = cam_quat_gt.view(batch_size * (num_views - 1), -1)
-                loss_pose = F.mse_loss(poses_pred[:,:4], cam_quat_gt[:,:4])
-                loss_trans = F.mse_loss(poses_pred[:,4:], cam_quat_gt[:,4:])
-                lossR_cam_quat = loss_pose + loss_trans
-                lossR = lossR_cam_quat
-                rot_error, trans_error = defaultdict(list), defaultdict(list)
-                rot_all = defaultdict(list)
-                canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
-                for img_idx in range(len(cam_quat_gt)):
-                    b_id = img_idx // (num_views - 1)
-                    cat = category[b_id]
-                    cur_rot_error, cur_trans_error = compute_pose_metric(poses_pred[img_idx].detach().cpu(), 
-                                                                         cam_quat_gt[img_idx].detach().cpu())
-                    
-                    # cur_trans_error = loss_trans.cpu().data.numpy()
-                    # cur_rot_error = compute_angular_error(cam_rot_gt[img_idx].detach().cpu().numpy(), cam_rot_pred[img_idx].detach().cpu().numpy())
-                    cur_rot, _ = compute_pose_metric(cam_quat_gt[img_idx].detach().cpu(), 
-                                                    canonical.detach().cpu())
-                    rot_all[cat].append(cur_rot)
-                    rot_error[cat].append(cur_rot_error)
-                    trans_error[cat].append(cur_trans_error)
-
-                for k in rot_all.keys():
-                    rot_error[k] = np.nanmean(rot_error[k])
-                    trans_error[k] = np.nanmean(trans_error[k])
-                    rot_all[k] = np.nanmean(rot_all[k])
-
-                if rank == 0:
-                    print('Val [%d/%d][%d/%d]\n'
-                    'lossR: %.4f lossR_fake: %.4f lossR_reg: %.4f lossR_data: %.4f, loss_pose: %.4f loss_trans: %.4f'
-                    'rot_all: %.4f rot_error: %.4f trans_error: %.4f \n'
-                        % (epoch, opt.niter, iter, len(test_dataloader),
-                            lossR.item(), lossR_fake.item(), lossR_reg.item(), lossR_data.item(),
-                            loss_pose.item(), loss_trans.item(), 
-                            np.mean([v for _, v in rot_all.items()]), 
-                            np.mean([v for _, v in rot_error.items()]), 
-                            np.mean([v for _, v in trans_error.items()]), 
-                            )
-                    )
-                lossR_all.append(lossR.item())
-                lossR_reg_all.append(lossR_reg.item())
-                lossR_flip_all.append(lossR_flip.item())
-                lossR_cam_quat_all.append(lossR_cam_quat.item())
-                lossR_data_all.append(lossR_data.item())
-                loss_pose_all.append(loss_pose.item())
-                loss_trans_all.append(loss_trans.item())
-
-                for k in rot_all.keys():
-                    rot_error_all[k].append(rot_error[k])
-                    rot_gt_all[k].append(rot_all[k])
-                    trans_error_all[k].append(trans_error[k])
-
-            if rank == 0:
-                summary_writer.add_scalar('Val/lossR', np.average(lossR_all), epoch)
-                summary_writer.add_scalar('Val/lossR_reg', np.average(lossR_reg_all), epoch)
-                summary_writer.add_scalar('Val/lossR_data', np.average(lossR_data_all), epoch)
-                summary_writer.add_scalar('Val/lossR_flip', np.average(lossR_flip_all), epoch)
-                summary_writer.add_scalar('Val/lossR_cam_quat', np.average(lossR_cam_quat_all), epoch)
-                summary_writer.add_scalar('Val/loss_pose', np.average(loss_pose_all), epoch)
-                summary_writer.add_scalar('Val/loss_trans', np.average(loss_trans_all), epoch)
-
-                summary_writer.add_scalar(f'Val/rot_gt', np.average([np.average(v) for _, v in rot_gt_all.items()]), epoch)
-                summary_writer.add_scalar(f'Val/rot_error', np.average([np.average(v) for _, v in rot_error_all.items()]), epoch)
-                summary_writer.add_scalar(f'Val/trans_error', np.average([np.average(v) for _, v in trans_error_all.items()]), epoch)
-                
-                for k in rot_error_all.keys():
-                    summary_writer.add_scalar(f'Val/rot_gt_{k}', np.average(rot_gt_all[k]), epoch)
-                    summary_writer.add_scalar(f'Val/rot_error_{k}', np.average(rot_error_all[k]), epoch)
-                    summary_writer.add_scalar(f'Val/trans_error_{k}', np.average(trans_error_all[k]), epoch)
-
-            netE.train()
-
-
-def init_process(rank, size, fn, backend='gloo'):
+def init_process(rank, size, fn, backend='nccl'):
     """ Initialize the distributed environment. """
+    torch.cuda.set_device(rank)
     os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
+    os.environ['MASTER_PORT'] = '29501'
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank, size)
 

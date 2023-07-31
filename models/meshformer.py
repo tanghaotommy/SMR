@@ -12,6 +12,9 @@ from .pose_estimator_2D import PoseEstimator2D, PoseEstimator2DFeat
 import geo_utils
 from utils import camera_position_from_spherical_angles, generate_transformation_matrix, compute_gradient_penalty, Timer, spherical_angles_from_camera_position
 import torch.nn.functional as F
+from models.model_utils import CrossAttention, SelfAttention
+from einops import rearrange
+from pytorch3d.transforms import quaternion_multiply
 
 
 class CameraDecoder(nn.Module):
@@ -101,67 +104,178 @@ class CameraDecoder(nn.Module):
         return cameras
     
 
+# class PoseDecoder(nn.Module):
+#     def __init__(self, transformer_hidden_dim, decoder):
+#         super(PoseDecoder, self).__init__()
+
+#         self.camera_query_embedding = nn.Embedding(1, transformer_hidden_dim)
+#         self.transformer_hidden_dim = transformer_hidden_dim
+#         self.proj_pose = nn.Linear(7, transformer_hidden_dim)
+#         self.decoder = decoder
+#         linear1 = self.linearblock(transformer_hidden_dim, 1024)
+#         linear2 = self.linearblock(1024, 1024)
+#         all_blocks = linear1 + linear2
+#         self.encoder2 = nn.Sequential(*all_blocks)
+#         self.linear = nn.Sequential(*[
+#             nn.Linear(transformer_hidden_dim, 256),
+#             nn.BatchNorm1d(256),
+#             nn.LeakyReLU(),
+#             nn.Linear(256, 7)
+#         ])
+#         self.batch_norm = nn.BatchNorm1d(transformer_hidden_dim)
+
+#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+#         for m in self.modules():
+#             if isinstance(m, nn.ConvTranspose2d) \
+#             or isinstance(m, nn.Linear) \
+#             or isinstance(object, nn.Conv2d):
+#                 nn.init.xavier_uniform_(m.weight)
+#                 nn.init.normal_(m.weight, mean=0, std=0.001)
+
+#     def linearblock(self, indim, outdim):
+#         block2 = [
+#             nn.Linear(indim, outdim),
+#             nn.BatchNorm1d(outdim),
+#             nn.ReLU()
+#         ]
+#         return block2
+
+#     def forward(self, tgt, pred_cameras, memory, pos_embed, mask):
+#         batch_size = memory.shape[1]
+#         num_views = tgt.shape[0]
+#         projected_pose = self.proj_pose(pred_cameras)
+
+#         # query_embed = self.camera_query_embedding.weight
+
+#         # query_embed = query_embed.unsqueeze(1).repeat(
+#         #     num_views, batch_size, 1
+#         # )
+
+#         decoder_output = self.decoder(
+#             tgt,
+#             memory,
+#             memory_key_padding_mask=mask,
+#             pos=pos_embed,
+#             query_pos=projected_pose,
+#         )
+#         decoder_output = decoder_output[0]
+#         decoder_output = decoder_output.permute(1, 0, 2).contiguous().view(-1, self.transformer_hidden_dim)
+#         cameras = self.linear(decoder_output)
+#         cameras = pred_cameras.permute(1, 0, 2).contiguous().view(-1, 7) + cameras
+
+#         return cameras
+
+
+class Embedder:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+        
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']
+        out_dim = 0
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x : x)
+            out_dim += d
+            
+        max_freq = self.kwargs['max_freq_log2']
+        N_freqs = self.kwargs['num_freqs']
+        
+        if self.kwargs['log_sampling']:
+            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
+        else:
+            freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
+            
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
+                out_dim += d
+                    
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+        
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+
+
+def get_embedder(multires, i=0, input_dims=3):
+    if i == -1:
+        return nn.Identity(), 3
+    
+    embed_kwargs = {
+                'include_input' : True,
+                'input_dims' : input_dims,
+                'max_freq_log2' : multires-1,
+                'num_freqs' : multires,
+                'log_sampling' : True,
+                'periodic_fns' : [torch.sin, torch.cos],
+    }
+    
+    embedder_obj = Embedder(**embed_kwargs)
+    embed = lambda x, eo=embedder_obj : eo.embed(x)
+    return embed, embedder_obj.out_dim
+
+
 class PoseDecoder(nn.Module):
-    def __init__(self, transformer_hidden_dim, decoder):
+    def __init__(self, feat_dim_in, feat_dim_out, num_points, pose_dim, num_views=5):
         super(PoseDecoder, self).__init__()
 
-        self.camera_query_embedding = nn.Embedding(1, transformer_hidden_dim)
-        self.transformer_hidden_dim = transformer_hidden_dim
-        self.proj_pose = nn.Linear(7, transformer_hidden_dim)
-        self.decoder = decoder
-        linear1 = self.linearblock(transformer_hidden_dim, 1024)
-        linear2 = self.linearblock(1024, 1024)
-        all_blocks = linear1 + linear2
-        self.encoder2 = nn.Sequential(*all_blocks)
-        self.linear = nn.Sequential(*[
-            nn.Linear(transformer_hidden_dim, 256),
+        self.self_attn_layers = 3
+        self.num_views = num_views
+
+        self.self_attn_blks = nn.ModuleList([
+            # SelfAttention(num_heads=4, num_channels=num_points * feat_dim_out, num_qk_channels=256, num_v_channels=256, num_output_channels=256, mlp_ratio=2)
+            SelfAttention(num_heads=4, num_channels=feat_dim_out, mlp_ratio=4)
+            for i in range(self.self_attn_layers)
+        ])
+
+        self.pose_embed_fn, pose_input_ch = get_embedder(5, 0, input_dims=pose_dim)
+        self.pc_embed_fn, pc_input_ch = get_embedder(5, 0, input_dims=3)
+        self.refine_linear = nn.Linear(feat_dim_in + pose_input_ch + pc_input_ch, feat_dim_out)
+        self.out = nn.Sequential(*[
+            nn.Linear(num_points * feat_dim_out, 256),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(),
             nn.Linear(256, 7)
         ])
-        self.batch_norm = nn.BatchNorm1d(transformer_hidden_dim)
 
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
 
-        for m in self.modules():
-            if isinstance(m, nn.ConvTranspose2d) \
-            or isinstance(m, nn.Linear) \
-            or isinstance(object, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.normal_(m.weight, mean=0, std=0.001)
+    def forward(self, pc_feat, pointcloud, coarse_pose):
+        num_views = self.num_views
+        b_views, num_points, _ = pointcloud.shape
+        batch_size = b_views // num_views
 
-    def linearblock(self, indim, outdim):
-        block2 = [
-            nn.Linear(indim, outdim),
-            nn.BatchNorm1d(outdim),
-            nn.ReLU()
-        ]
-        return block2
+        pose_embed = self.pose_embed_fn(coarse_pose.unsqueeze(1).expand(-1, num_points, -1))
+        pointcloud_embed = self.pc_embed_fn(pointcloud)
+        x = torch.cat([pc_feat, pose_embed, pointcloud_embed], dim=-1)
+        x = self.refine_linear(x)
+        x = x.view(batch_size, num_views * num_points, -1)
 
-    def forward(self, tgt, pred_cameras, memory, pos_embed, mask):
-        batch_size = memory.shape[1]
-        num_views = tgt.shape[0]
-        projected_pose = self.proj_pose(pred_cameras)
+        for self_attn_blk in self.self_attn_blks:
+            feat = self_attn_blk(x)
 
-        # query_embed = self.camera_query_embedding.weight
+        feat = rearrange(feat, 'b (t n) c -> b t n c', t=num_views) 
+        feat = rearrange(feat, 'b t n c -> (b t) (c n)', t=num_views) 
+        refine_pose = self.out(feat)
 
-        # query_embed = query_embed.unsqueeze(1).repeat(
-        #     num_views, batch_size, 1
-        # )
+        # normalize refine pose, make sure its a rotation quaternion
+        tmp = torch.zeros_like(refine_pose)
+        tmp[:,:4] = F.normalize(refine_pose[:,:4])
+        tmp[:,4:] = refine_pose[:,4:]
+        refine_pose = tmp
 
-        decoder_output = self.decoder(
-            tgt,
-            memory,
-            memory_key_padding_mask=mask,
-            pos=pos_embed,
-            query_pos=projected_pose,
-        )
-        decoder_output = decoder_output[0]
-        decoder_output = decoder_output.permute(1, 0, 2).contiguous().view(-1, self.transformer_hidden_dim)
-        cameras = self.linear(decoder_output)
-        cameras = pred_cameras.permute(1, 0, 2).contiguous().view(-1, 7) + cameras
+        pose = refine_pose
+        pose[:, :4] = quaternion_multiply(refine_pose[:, :4], coarse_pose[:, :4])
+        pose[:, 4:] = refine_pose[:, 4:] + coarse_pose[:, 4:]
 
-        return cameras
+        pose = pose.view(batch_size, num_views, -1)
+        # ignore the canonical frame
+        pose = pose[:, 1:, :].contiguous()
+        pose = pose.view(batch_size * (num_views - 1), -1)
+
+        return pose
 
 
 class Attention(nn.Module):
@@ -819,7 +933,7 @@ class MeshFormer(nn.Module):
 class MultiViewMeshFormer(nn.Module):
     """This is the base class for Transformer based mesh reconstruction"""
 
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False, norm_layer=None):
         """Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -833,7 +947,7 @@ class MultiViewMeshFormer(nn.Module):
         self.load_pretrained = load_pretrained
         self.refine_pose = refine_pose
 
-        self.backbone = build_backbone("resnet18", load_pretrained=load_pretrained)
+        self.backbone = build_backbone("resnet18", load_pretrained=load_pretrained, norm_layer=norm_layer)
         # self.transformer = build_transformer(nheads=4, enc_layers=2, dec_layers=2)
         hidden_dim = 256
         pre_norm = False
@@ -901,7 +1015,7 @@ class MultiViewMeshFormer(nn.Module):
         )
         # self.pose_estimator = PairwisePoseEstimator(d_model, encoder, azi_scope, elev_range, dist_range)
         # self.pose_estimator = PoseEstimator2D()
-        self.pose_estimator = PoseEstimator2DFeat()
+        self.pose_estimator = PoseEstimator2DFeat(norm_layer=norm_layer)
 
         self._reset_parameters()
 
@@ -946,7 +1060,7 @@ class MultiViewMeshFormer(nn.Module):
         self.camera_decoder = CameraDecoder(d_model, decoder, azi_scope, elev_range, dist_range)
 
         if self.refine_pose:
-            self.pose_refiner = PoseDecoder(d_model + self.pose_embed_size, decoder)
+            self.pose_refiner = PoseDecoder(d_model, 32, num_vertices, self.pose_embed_size, num_views=5)
 
         # light decoder
         decoder_layer = TransformerDecoderLayer(
@@ -1007,8 +1121,11 @@ class MultiViewMeshFormer(nn.Module):
         mask_vec = mask.flatten(1)  # BxHW
         return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
 
-    def forward(self, x, gt_poses, use_gt_pose=False):
+    def forward(self, x, data, use_gt_pose=False):
+        self.eval()
         device = x.device
+        gt_poses = data["gt_poses"]
+        center = data["center"]
         # pretrained assume we only have RGB, no mask as 4th channel
         if self.load_pretrained:
             x = x[:, :, :3, :, :]
@@ -1084,11 +1201,6 @@ class MultiViewMeshFormer(nn.Module):
         pred_cameras = self.pose_estimator(output["feat"].permute(1, 2, 0).contiguous().view(batch_size, num_views, dim, feat_H, feat_W))
 
         # pred camera pose to spherical coordinate
-        canonical = torch.FloatTensor([[ 1.0000,  0.0000,  0.0000,  0.0000],
-            [ 0.0000,  0.8660,  0.5000,  0.0000],
-            [ 0.0000, -0.5000,  0.8660,  0.0000],
-            [ 0.0000,  0.0000, -3.0000,  1.0000]]
-        ).to(pred_cameras.device)
         # canonical_quat = torch.FloatTensor([ 0.9659, -0.2588,  0.0000,  0.0000,  0.0000,  0.0000, -3.0000]).to(pred_cameras.device)
         canonical_quat = torch.FloatTensor([ 1.0000, 0.0000,  0.0000,  0.0000,  0.0000,  0.0000, 0.0000]).to(pred_cameras.device)
         tmp = torch.zeros_like(pred_cameras)
@@ -1121,15 +1233,68 @@ class MultiViewMeshFormer(nn.Module):
         delta_vertices = self.shape_decoder(shape_memory, self.vertices_init.to(device), shape_pos_embed, mask)
         
         if self.refine_pose:
-            pred_cameras = self.pose_refiner(
-                tgt.view(batch_size, num_views, -1)[:, 1:, :].permute(1, 0, 2).contiguous(), 
-                pred_cameras.view(batch_size, num_views - 1, -1).permute(1, 0, 2).contiguous(), 
-                shape_memory, 
-                shape_pos_embed, 
-                mask
-            )
-            # pred_cameras = self.pose_refiner(pred_cameras.view(batch_size, num_views - 1, -1).permute(1, 0, 2).contiguous(), memory, mask=mask, pos_embed=pos_embed)
+            # pred_rel_pose = geo_utils.quat2mat(gt_poses.view(batch_size * (num_views - 1), -1))
+            pred_rel_pose = geo_utils.quat2mat(poses_pred)
+            canonical = data["absolute_poses"][0][:1]
+            pred_absolute_pose = geo_utils.transform_relative_pose(canonical, pred_rel_pose).view(batch_size, num_views - 1, 4, 4)
+            pred_absolute_pose = torch.cat([canonical[None].expand(batch_size, -1, -1, -1), pred_absolute_pose], dim=1)
+            pred_absolute_pose = pred_absolute_pose.view(batch_size * num_views, 4, 4)
 
+            R_kaolin = pred_absolute_pose[:, :3, :3]
+            T_kaolin = pred_absolute_pose[:, 3, :3]
+            R_opencv, T_opencv = geo_utils.kaolin2opencv(R_kaolin, T_kaolin)
+            RT_opencv = torch.cat([R_opencv, T_opencv.unsqueeze(-1)], dim=-1)
+            vertices = self.vertices_init[None].to(delta_vertices.device) + delta_vertices.repeat_interleave(num_views, dim=0)
+            focal_length = data["focal_length"]
+            k = torch.zeros([batch_size, num_views, 3, 3]).to(device)
+            k[:, :, 0, 0] = focal_length[:, :, 0] * min(W, H) // 2
+            k[:, :, 1, 1] = focal_length[:, :, 1] * min(W, H) // 2
+            k[:, :, 0, 2] = W // 2
+            k[:, :, 1, 2] = H // 2
+            k[:, :, 2, 2] = 1
+            k = k.view(-1, 3, 3)
+
+            projected_pts, dpt = geo_utils.project_points_torch(
+                vertices + center.repeat_interleave(num_views, dim=0).unsqueeze(1), 
+                RT_opencv, 
+                k
+            )    
+            normalized_pts = projected_pts.clone().detach()        
+            normalized_pts[:, :, 0] = normalized_pts[:, :, 0] / W * 2 - 1
+            normalized_pts[:, :, 1] = normalized_pts[:, :, 1] / H * 2 - 1
+
+            feat_tensor = output_back[0].tensors
+            pc_feat = F.grid_sample(feat_tensor, normalized_pts.unsqueeze(-2)).squeeze()
+            rgb_feat = F.grid_sample(img.view(batch_size * num_views, C, H, W), normalized_pts.unsqueeze(-2)).squeeze()
+
+            absolute_pose = data["absolute_poses"].view(batch_size * num_views, 4, 4)
+
+            refined_cameras = self.pose_refiner(pc_feat.transpose(1, 2), vertices.detach(), torch.cat([canonical_quat, poses_pred.view(batch_size, num_views - 1, -1)], dim=1).view(batch_size * num_views, -1).detach())
+        else:
+            refined_cameras = None
+
+            # # Debug and visualize
+            # import matplotlib.pyplot as plt
+            # import os
+            # import eval_utils
+            # for i, im in enumerate(img.view(batch_size * num_views, 4, H, W)):
+            #     rot_error = eval_utils.compute_angular_error(R_kaolin[i].cpu().data.numpy(), absolute_pose[i][:3, :3].cpu().data.numpy())
+            #     print(i, rot_error)
+            #     plt.figure(figsize=(12, 8))
+            #     plt.subplot(131)
+            #     plt.imshow(im.permute(1, 2, 0)[:, :, :3].cpu().data.numpy())
+
+            #     plt.subplot(132)
+            #     plt.imshow(im.permute(1, 2, 0)[:, :, :3].cpu().data.numpy())
+            #     plt.scatter(projected_pts[i, :, 0].cpu().data.numpy(), projected_pts[i, :, 1].cpu().data.numpy())
+
+            #     plt.subplot(133)
+            #     plt.imshow(np.ones_like(im.permute(1, 2, 0)[:, :, :3].cpu().data.numpy()))
+            #     plt.scatter(projected_pts[i, :, 0].cpu().data.numpy(), projected_pts[i, :, 1].cpu().data.numpy(), c=rgb_feat[i][:3].T.cpu().data.numpy(), s=5)
+
+
+            #     plt.savefig(os.path.join("/private/home/haotang/dev/SMR/output/debug", f"{i}.jpg"))
+            #     plt.close()
 
         # lights = self.light_decoder(memory, pos_embed, mask)
         # lights = lights.repeat_interleave(num_views, dim=0)
@@ -1140,10 +1305,17 @@ class MultiViewMeshFormer(nn.Module):
         # repeat shape prediction for every item
         delta_vertices = delta_vertices.repeat_interleave(num_views, dim=0)
 
-        return delta_vertices, _, lights, textures, pred_cameras, shape_memory.view(num_views, 8, 8, batch_size, dim).permute(3, 0, 4, 1, 2)[:, :, :256, :, :]
+        return {
+            "delta_vertices": delta_vertices,
+            "lights": lights, 
+            "textures": textures, 
+            "pred_cameras": pred_cameras, 
+            "shape_memory": shape_memory.view(num_views, 8, 8, batch_size, dim).permute(3, 0, 4, 1, 2)[:, :, :256, :, :],
+            "refined_cameras": refined_cameras,
+        }
 
 
-def build_backbone(backbone_type="resnet50", train_backbone=True, load_pretrained=False):
+def build_backbone(backbone_type="resnet50", train_backbone=True, load_pretrained=False, norm_layer=None):
     position_embedding = build_position_encoding()
     backbone = Backbone(
         backbone_type,
@@ -1153,7 +1325,8 @@ def build_backbone(backbone_type="resnet50", train_backbone=True, load_pretraine
         load_pretrained, # since the input channel is 4 instead of 3, we need to train the entire network
         None,
         pretrained=load_pretrained,
-        input_dim=3 if load_pretrained else 4
+        input_dim=3 if load_pretrained else 4,
+        norm_layer=norm_layer
     )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
