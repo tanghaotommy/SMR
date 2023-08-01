@@ -1119,22 +1119,22 @@ def train_main(rank, size):
 
     if opt.resume:
         resume_path = os.path.join(opt.outf, 'ckpts/latest_ckpt.pth')
-        if rank == 0:
-            if os.path.exists(resume_path):
-                print("=> loading checkpoint '{}'".format(opt.resume))
-                # Map model to be loaded to specified single gpu.
-                checkpoint = torch.load(resume_path)
-                start_epoch = checkpoint['epoch']
-                start_iter = 0
-                netE.load_state_dict(checkpoint['netE'])
+        # if rank == 0:
+        if os.path.exists(resume_path):
+            print("=> loading checkpoint '{}'".format(opt.resume))
+            # Map model to be loaded to specified single gpu.
+            checkpoint = torch.load(resume_path)
+            start_epoch = checkpoint['epoch']
+            start_iter = 0
+            netE.load_state_dict(checkpoint['netE'])
 
-                optimizerE.load_state_dict(checkpoint['optimizerE'])
-                print("=> loaded checkpoint '{}' (epoch {})"
-                    .format(resume_path, checkpoint['epoch']))
-            else:
-                start_iter = 0
-                start_epoch = 0
-                print("=> no checkpoint can be found")
+            optimizerE.load_state_dict(checkpoint['optimizerE'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                .format(resume_path, checkpoint['epoch']))
+        else:
+            start_iter = 0
+            start_epoch = 0
+            print("=> no checkpoint can be found")
 
     ori_dir = os.path.join(opt.outf, 'fid/ori')
     rec_dir = os.path.join(opt.outf, 'fid/rec')
