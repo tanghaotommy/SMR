@@ -1,5 +1,6 @@
 import argparse
 from collections import defaultdict
+import csv
 import os
 import random
 import math
@@ -47,6 +48,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
+import time
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -84,6 +86,8 @@ parser.add_argument('--visualization_epoch', type=int, default=1)
 parser.add_argument('--val_epoch', type=int, default=10)
 parser.add_argument('--ddp', action='store_true', default=False, help='whether use distributedparallel')
 parser.add_argument('--refine_pose', action='store_true', default=False, help='whether refine initial pose')
+parser.add_argument('--num_refine', type=int, default=3, help='number of pose refinement iterations')
+parser.add_argument('--eval_only', action='store_true', default=False, help='whether run only evaluation')
 parser.add_argument('--norm_layer', default=None, help='which normalization to use')
 parser.add_argument('--n_gpu_per_node', type=int, default=2, help='number of GPUs per node')
 
@@ -541,12 +545,13 @@ class AttributeEncoder(nn.Module):
 
 
 class MeshFormerEncoder(nn.Module):
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False, norm_layer=None):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False, norm_layer=None, num_refine=opt.num_refine):
         super(MeshFormerEncoder, self).__init__()
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
         self.use_multi_view_texture = use_multi_view_texture
         self.refine_pose = refine_pose
+        self.num_refine = num_refine
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
         self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer)
@@ -569,7 +574,7 @@ class MeshFormerEncoder(nn.Module):
         lights = ret["lights"]
         textures = ret["textures"]
         pred_cameras = ret["pred_cameras"]
-        refined_cameras = ret["refined_cameras"]
+        refined_cameras_dict = ret["refined_cameras_dict"]
         shape_memory = ret["shape_memory"]
 
         # # cameras
@@ -604,7 +609,7 @@ class MeshFormerEncoder(nn.Module):
             'lights': lights,
             'img_feats': img_feats,
             'pred_cameras': pred_cameras,
-            'refined_cameras': refined_cameras
+            'refined_cameras_dict': refined_cameras_dict
         }
         return attributes
 
@@ -665,12 +670,22 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
     loss_trans_all = []
     loss_refined_pose_all = []
     loss_refined_trans_all = []
+    loss_refined_pose_dict_all = defaultdict(list)
+    loss_refined_trans_dict_all = defaultdict(list)
     lossR_refined_cam_quat_all = []
     rot_error_all = defaultdict(list)
+    refined_rot_error_dict_all = defaultdict(lambda: defaultdict(list))
+    refined_trans_error_dict_all = defaultdict(lambda: defaultdict(list))
     rot_gt_all = defaultdict(list)
     trans_error_all = defaultdict(list)
     refined_rot_error_all = defaultdict(list)
     refined_trans_error_all = defaultdict(list)
+
+    rot_error_all_list = defaultdict(list)
+    rot_gt_all_list = defaultdict(list)
+    trans_error_all_list = defaultdict(list)
+    refined_rot_error_all_list = defaultdict(list)
+    refined_trans_error_all_list = defaultdict(list)
 
     for iter, data in enumerate(dataloader):
         Xa = Variable(data['data']['images']).cuda()
@@ -730,7 +745,7 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
 
         device = Xb.device
         poses_pred = Ae["pred_cameras"]
-        refined_poses_pred = Ae["refined_cameras"]
+        refined_poses_pred_dict = Ae["refined_cameras_dict"]
         
         tmp = torch.zeros_like(poses_pred)
         tmp[:,:4] = F.normalize(poses_pred[:,:4])
@@ -756,24 +771,39 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         lossR_cam_quat = loss_pose + loss_trans
 
         if opt.refine_pose:
-            loss_refined_pose = F.mse_loss(refined_poses_pred[:,:4], cam_quat_gt[:,:4], reduction='none')
-            loss_refined_trans = F.mse_loss(refined_poses_pred[:,4:], cam_quat_gt[:,4:], reduction='none')
-            loss_refined_pose = loss_refined_pose[loss_refined_pose < 10].mean()
-            loss_refined_trans = loss_refined_trans[loss_refined_trans < 10].mean()
+            loss_refined_pose_dict = {}
+            loss_refined_trans_dict = {}
+            for refine_iter, refined_poses_pred in refined_poses_pred_dict.items():
+                loss_refined_pose_iter = F.mse_loss(refined_poses_pred[:, :3, :3], relative_poses[:, :, :3, :3].view(batch_size * (num_views - 1), 3, 3), reduction='none')
+                loss_refined_trans_iter = F.mse_loss(refined_poses_pred[:, 3, :3], cam_quat_gt[:, 4:], reduction='none')
+                loss_refined_pose_iter = loss_refined_pose_iter[loss_refined_pose_iter < 10].mean()
+                loss_refined_trans_iter = loss_refined_trans_iter[loss_refined_trans_iter < 10].mean()
+                loss_refined_pose_dict[refine_iter] = loss_refined_pose_iter
+                loss_refined_trans_dict[refine_iter] = loss_refined_trans_iter
+
+            loss_refine_iter_name = f"refined_cameras_{opt.num_refine - 1}"
+            if loss_refine_iter_name == "all":
+                loss_refined_pose = torch.sum([v for _, v in loss_refined_pose_dict.items()])
+                loss_refined_trans = torch.sum([v for _, v in loss_refined_trans_dict.items()])
+            else:
+                loss_refined_pose = loss_refined_pose_dict[loss_refine_iter_name]
+                loss_refined_trans = loss_refined_trans_dict[loss_refine_iter_name]
         else:
             loss_refined_pose = torch.zeros_like(loss_pose)
             loss_refined_trans = torch.zeros_like(loss_trans)
 
         lossR_refined_cam_quat = loss_refined_pose + loss_refined_trans
 
-        # lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat + lossR_refined_cam_quat
-        lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
+        lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat + lossR_refined_cam_quat
+        # lossR = lossR_fake + lossR_reg + lossR_data + lossR_IC +  lossR_LC + lossR_cam_quat
 
         rot_error_batch = []
         rot_error, trans_error = defaultdict(list), defaultdict(list)
         refined_rot_error, refined_trans_error = defaultdict(list), defaultdict(list)
+        refined_rot_error_dict, refined_trans_error_dict = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
         rot_all = defaultdict(list)
         canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
+        refined_poses_pred_dict = {k: geo_utils.mat2quat(v) for k, v in refined_poses_pred_dict.items()}
         for img_idx in range(len(cam_quat_gt)):
             b_id = img_idx // (num_views - 1)
             cat = category[b_id]
@@ -787,18 +817,37 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
             trans_error[cat].append(cur_trans_error)
 
             if opt.refine_pose:
+                for refine_iter_name in refined_poses_pred_dict.keys():
+                    refined_poses_pred = refined_poses_pred_dict[refine_iter_name] 
+                    cur_rot_error, cur_trans_error = compute_pose_metric(refined_poses_pred[img_idx].detach().cpu(), 
+                                                                cam_quat_gt[img_idx].detach().cpu())
+                    refined_rot_error_dict[refine_iter_name][cat].append(cur_rot_error)
+                    refined_trans_error_dict[refine_iter_name][cat].append(cur_trans_error)
+
+                final_refine_iter_name = f"refined_cameras_{opt.num_refine - 1}"
+                refined_poses_pred = refined_poses_pred_dict[final_refine_iter_name] 
                 cur_rot_error, cur_trans_error = compute_pose_metric(refined_poses_pred[img_idx].detach().cpu(), 
                                                             cam_quat_gt[img_idx].detach().cpu())
-
+                    
             refined_rot_error[cat].append(cur_rot_error)
             refined_trans_error[cat].append(cur_trans_error)
 
         for k in rot_all.keys():
+            rot_error_all_list[k].extend(rot_error[k])
+            rot_gt_all_list[k].extend(rot_all[k])
+            trans_error_all_list[k].extend(trans_error[k])
+            refined_rot_error_all_list[k].extend(refined_rot_error[k])
+            refined_trans_error_all_list[k].extend(refined_trans_error[k])
+
             rot_error[k] = np.nanmean(rot_error[k])
             trans_error[k] = np.nanmean(trans_error[k])
             refined_rot_error[k] = np.nanmean(refined_rot_error[k])
             refined_trans_error[k] = np.nanmean(refined_trans_error[k])
             rot_all[k] = np.nanmean(rot_all[k])
+
+            for refine_iter_name in refined_rot_error_dict.keys():
+                refined_rot_error_dict[refine_iter_name][k] = np.nanmean(refined_rot_error_dict[refine_iter_name][k])
+                refined_trans_error_dict[refine_iter_name][k] = np.nanmean(refined_trans_error_dict[refine_iter_name][k])
 
         # record result from each iteration
         lossR_all.append(lossR.item())
@@ -811,12 +860,20 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         loss_refined_pose_all.append(loss_refined_pose.item())
         loss_refined_trans_all.append(loss_refined_trans.item())
 
+        for k in loss_refined_pose_dict.keys():
+            loss_refined_pose_dict_all[k].append(loss_refined_pose_dict[k].item())
+            loss_refined_trans_dict_all[k].append(loss_refined_trans_dict[k].item())
+
         for k in rot_all.keys():
             rot_error_all[k].append(rot_error[k])
             rot_gt_all[k].append(rot_all[k])
             trans_error_all[k].append(trans_error[k])
-            refined_rot_error_all[k].append(refined_rot_error[k])
+            refined_rot_error_all[k].append(refined_rot_error[k]) 
             refined_trans_error_all[k].append(refined_trans_error[k])
+
+            for refine_iter_name in refined_rot_error_dict.keys():
+                refined_rot_error_dict_all[refine_iter_name][k].append(refined_rot_error_dict[refine_iter_name][k])
+                refined_trans_error_dict_all[refine_iter_name][k].append(refined_trans_error_dict[refine_iter_name][k])
 
         # if rank == 0:
         print('Name: ', opt.outf)
@@ -856,16 +913,24 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         "refined_rot_error": [np.average(v) for _, v in refined_rot_error_all.items()],
         "refined_trans_error": [np.average(v) for _, v in refined_trans_error_all.items()],
     }
+    for k in loss_refined_pose_dict_all.keys():
+        refine_iter = k.split('_')[-1]
+        ret_dict[f"loss_refined_pose_{refine_iter}"] = loss_refined_pose_dict_all[k]
+        ret_dict[f"loss_refined_trans_{refine_iter}"] = loss_refined_trans_dict_all[k]
 
-    print(f"{rank} total keys {len(ret_dict)}", flush=True)
-    keys = ret_dict.keys()
-    values = [torch.Tensor(ret_dict[k]).mean() for k in ret_dict.keys()]
-    values = torch.Tensor(values).cuda()
+        ret_dict[f"refined_rot_error_iter_{refine_iter}"] = [np.average(v) for _, v in refined_rot_error_dict_all[k].items()]
+        ret_dict[f"refined_trans_error_iter_{refine_iter}"] = [np.average(v) for _, v in refined_trans_error_dict_all[k].items()]
 
-    print(f"{rank} synchronize", flush=True)
-    dist.barrier(device_ids=[torch.cuda.current_device()])
-    dist.all_reduce(values, op=dist.ReduceOp.AVG)
-    ret_dict = {k: v.item() for k, v in zip(keys, values)}
+    if opt.ddp:
+        print(f"{rank} total keys {len(ret_dict)}", flush=True)
+        keys = ret_dict.keys()
+        values = [torch.Tensor(ret_dict[k]).mean() for k in ret_dict.keys()]
+        values = torch.Tensor(values).cuda()
+
+        print(f"{rank} synchronize", flush=True)
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+        dist.all_reduce(values, op=dist.ReduceOp.AVG)
+        ret_dict = {k: v.item() for k, v in zip(keys, values)}
 
     for k in rot_error_all.keys():
         ret_dict[f"rot_gt_{k}"] = rot_gt_all[k]
@@ -874,12 +939,44 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         ret_dict[f"refined_rot_error_{k}"] = refined_rot_error_all[k]
         ret_dict[f"refined_trans_error_{k}"] = refined_trans_error_all[k]
 
-    if rank == 0:
+    if rank == 0 and not opt.eval_only:
         print("Writing summary writer...", flush=True)
         summary_writer.add_scalar(f'{mode}/lr', scheduler.get_last_lr()[0], epoch)
         for k, v in ret_dict.items():
             summary_writer.add_scalar(f'{mode}/{k}', np.average(v), epoch)
 
+    if opt.eval_only:
+        header = ["category", "rot_error (angle)", "rot_gt (angle)", "acc@15", "acc@30"]
+        df = []
+        error_list = refined_rot_error_all_list
+        for k in error_list.keys():
+            print(len(error_list[k]))
+            df.append([
+                k,
+                np.average(error_list[k]),
+                np.average(rot_gt_all_list[k]),
+                np.average(np.array(error_list[k]) < 15) * 100,
+                np.average(np.array(error_list[k]) < 30) * 100,
+            ])
+        
+        r_e_l = np.concatenate([v for _, v in error_list.items()])
+        df.append([
+            "all",
+            np.average(np.average([np.average(v) for _, v in error_list.items()])),
+            np.average(np.average([np.average(v) for _, v in rot_gt_all_list.items()])),
+            np.average(r_e_l < 15) * 100,
+            np.average(r_e_l < 30) * 100,
+        ])
+        print(df)
+        with open(os.path.join(opt.outf, "eval_result.csv"), 'w') as csvfile: 
+            # creating a csv writer object 
+            csvwriter = csv.writer(csvfile) 
+                
+            # writing the fields 
+            csvwriter.writerow(header) 
+                
+            # writing the data rows 
+            csvwriter.writerows(df)
 
     if epoch % opt.visualization_epoch == 0 and rank == 0 and mode == "Train":
         num_images = Xa.shape[0]
@@ -1063,9 +1160,9 @@ def train_main(rank, size):
         training_sampler = test_sampler = None
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batchSize, sampler=training_sampler,
-                                            shuffle=None if opt.ddp else True, drop_last=False if not opt.ddp else True, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True)
+                                            shuffle=None if opt.ddp else True, drop_last=False if not opt.ddp else True, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True if opt.workers > 0 else False)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batchSize, sampler=test_sampler,
-                                            shuffle=None if opt.ddp else False, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True)
+                                            shuffle=None if opt.ddp else False, pin_memory=True, num_workers=int(opt.workers), persistent_workers=True if opt.workers > 0 else False)
 
     print(f"Rank {rank}, dataset: {len(train_dataset)}, dataloader: {len(train_dataloader)}")
 
@@ -1092,14 +1189,9 @@ def train_main(rank, size):
         raise NotImplementedError
     
     netE = netE.cuda()
-    netE = DDP(netE, find_unused_parameters=True)
 
     # setup optimizer
     optimizerE = optim.Adam(list(netE.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
-
-    # setup learning rate scheduler
-    schedulerE = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerE, T_max=opt.niter, eta_min=1e-6)
-    # schedulerE = torch.optim.lr_scheduler.StepLR(optimizerE, step_size=200, gamma=0.5)
 
     # if resume is True, restore from latest_ckpt.path
     start_iter = 0
@@ -1112,29 +1204,36 @@ def train_main(rank, size):
             # Map model to be loaded to specified single gpu.
             checkpoint = torch.load(resume_path)
             start_iter = 0
-            netE.load_state_dict(checkpoint['netE'], strict=False)
+            netE.load_state_dict({k.split("module.")[-1]: v for k, v in checkpoint['netE'].items()}, strict=False)
 
             print("=> loaded pretrained checkpoint '{}' (epoch {})"
                 .format(resume_path, checkpoint['epoch']))
 
     if opt.resume:
         resume_path = os.path.join(opt.outf, 'ckpts/latest_ckpt.pth')
-        if rank == 0:
-            if os.path.exists(resume_path):
-                print("=> loading checkpoint '{}'".format(opt.resume))
-                # Map model to be loaded to specified single gpu.
-                checkpoint = torch.load(resume_path)
-                start_epoch = checkpoint['epoch']
-                start_iter = 0
-                netE.load_state_dict(checkpoint['netE'])
+        # if rank == 0:
+        if os.path.exists(resume_path):
+            print("=> loading checkpoint '{}'".format(opt.resume))
+            # Map model to be loaded to specified single gpu.
+            checkpoint = torch.load(resume_path)
+            start_epoch = checkpoint['epoch']
+            start_iter = 0
+            netE.load_state_dict({k.split("module.")[-1]: v for k, v in checkpoint['netE'].items()})
 
-                optimizerE.load_state_dict(checkpoint['optimizerE'])
-                print("=> loaded checkpoint '{}' (epoch {})"
-                    .format(resume_path, checkpoint['epoch']))
-            else:
-                start_iter = 0
-                start_epoch = 0
-                print("=> no checkpoint can be found")
+            optimizerE.load_state_dict(checkpoint['optimizerE'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                .format(resume_path, checkpoint['epoch']))
+        else:
+            start_iter = 0
+            start_epoch = 0
+            print("=> no checkpoint can be found")
+
+    if opt.ddp:
+        netE = DDP(netE, find_unused_parameters=True)
+
+    # setup learning rate scheduler
+    schedulerE = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerE, T_max=opt.niter, eta_min=1e-6, last_epoch=start_epoch - 1)
+    # schedulerE = torch.optim.lr_scheduler.StepLR(optimizerE, step_size=200, gamma=0.5)
 
     ori_dir = os.path.join(opt.outf, 'fid/ori')
     rec_dir = os.path.join(opt.outf, 'fid/rec')
@@ -1151,27 +1250,33 @@ def train_main(rank, size):
     else: 
         summary_writer = None
 
-    for epoch in range(start_epoch, opt.niter):
-        if training_sampler is not None:
-            training_sampler.set_epoch(epoch)
-        netE.train()
-        forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, train_dataloader, summary_writer, mode="Train")
+    if opt.eval_only:
+        netE.eval()
+        with torch.no_grad():
+            forward_pass(start_epoch, rank, netE, optimizerE, schedulerE, diffRender, test_dataloader, summary_writer, mode="Val")
+    else:
+        for epoch in range(start_epoch, opt.niter):
+            if training_sampler is not None:
+                training_sampler.set_epoch(epoch)
+            netE.train()
+            forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, train_dataloader, summary_writer, mode="Train")
 
-        if epoch % 2 == 0 and rank == 0:
-            epoch_name = os.path.join(ckpt_dir, 'epoch_%05d.pth' % epoch)
-            latest_name = os.path.join(ckpt_dir, 'latest_ckpt.pth')
-            state_dict = {
-                'epoch': epoch,
-                'netE': netE.state_dict(),
-                'optimizerE': optimizerE.state_dict(),
-            }
-            torch.save(state_dict, latest_name)
+            if epoch % 2 == 0 and rank == 0:
+                epoch_name = os.path.join(ckpt_dir, 'epoch_%05d.pth' % epoch)
+                latest_name = os.path.join(ckpt_dir, 'latest_ckpt.pth')
+                state_dict = {
+                    'epoch': epoch,
+                    'netE': netE.state_dict(),
+                    'optimizerE': optimizerE.state_dict(),
+                }
+                torch.save(state_dict, latest_name)
 
-        if epoch % opt.val_epoch == 0 and epoch > 0:
-            netE.eval()
-            forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, test_dataloader, summary_writer, mode="Val")
+            if epoch % opt.val_epoch == 0 and epoch > 0:
+                netE.eval()
+                with torch.no_grad():
+                    forward_pass(epoch, rank, netE, optimizerE, schedulerE, diffRender, test_dataloader, summary_writer, mode="Val")
 
-        schedulerE.step()
+            schedulerE.step()
 
 
 def init_process(rank, size, fn, backend='nccl'):

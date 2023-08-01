@@ -58,8 +58,8 @@ srun  python train_multiview.py --batchSize 12 \
                     --dataset co3d_seq \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --norm_layer InstanceNorm2d \
-                    --outf ./log/MeshPoseFormer/bicycle_pose_ddp_instance_norm_original_pose_only \
+                    --pretrained_path ./log/MeshPoseFormer/pretrained_30cat_512  \
+                    --outf ./log/MeshPoseFormer/30cat_from_pretrained_512_3_iter_refine \
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \

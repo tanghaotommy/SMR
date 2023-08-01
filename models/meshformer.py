@@ -266,14 +266,17 @@ class PoseDecoder(nn.Module):
         tmp[:,4:] = refine_pose[:,4:]
         refine_pose = tmp
 
-        pose = refine_pose
-        pose[:, :4] = quaternion_multiply(refine_pose[:, :4], coarse_pose[:, :4])
-        pose[:, 4:] = refine_pose[:, 4:] + coarse_pose[:, 4:]
+        coarse_pose = geo_utils.quat2mat(coarse_pose)
+        refine_pose = geo_utils.quat2mat(refine_pose)
 
-        pose = pose.view(batch_size, num_views, -1)
+        R = coarse_pose[:, :3, :3] @ refine_pose[:, :3, :3]
+        T = refine_pose[:, 3, :3] + coarse_pose[:, 3, :3]
+        pose = geo_utils.get_cam_transform(R, T)
+
+        pose = pose.view(batch_size, num_views, 4, 4)
         # ignore the canonical frame
-        pose = pose[:, 1:, :].contiguous()
-        pose = pose.view(batch_size * (num_views - 1), -1)
+        pose = pose[:, 1:, :, :].contiguous()
+        pose = pose.view(batch_size * (num_views - 1), 4, 4)
 
         return pose
 
@@ -933,7 +936,7 @@ class MeshFormer(nn.Module):
 class MultiViewMeshFormer(nn.Module):
     """This is the base class for Transformer based mesh reconstruction"""
 
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False, norm_layer=None):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False, norm_layer=None, num_refine=3):
         """Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -946,6 +949,7 @@ class MultiViewMeshFormer(nn.Module):
         self.vertices_init = vertices_init
         self.load_pretrained = load_pretrained
         self.refine_pose = refine_pose
+        self.num_refine = num_refine
 
         self.backbone = build_backbone("resnet18", load_pretrained=load_pretrained, norm_layer=norm_layer)
         # self.transformer = build_transformer(nheads=4, enc_layers=2, dec_layers=2)
@@ -1233,43 +1237,51 @@ class MultiViewMeshFormer(nn.Module):
         delta_vertices = self.shape_decoder(shape_memory, self.vertices_init.to(device), shape_pos_embed, mask)
         
         if self.refine_pose:
-            # pred_rel_pose = geo_utils.quat2mat(gt_poses.view(batch_size * (num_views - 1), -1))
-            pred_rel_pose = geo_utils.quat2mat(poses_pred)
-            canonical = data["absolute_poses"][0][:1]
-            pred_absolute_pose = geo_utils.transform_relative_pose(canonical, pred_rel_pose).view(batch_size, num_views - 1, 4, 4)
-            pred_absolute_pose = torch.cat([canonical[None].expand(batch_size, -1, -1, -1), pred_absolute_pose], dim=1)
-            pred_absolute_pose = pred_absolute_pose.view(batch_size * num_views, 4, 4)
+            refined_poses = geo_utils.quat2mat(poses_pred).detach()
+            refined_cameras_dict = {}
+            for refine_iter in range(self.num_refine):
+                # pred_rel_pose = geo_utils.quat2mat(gt_poses.view(batch_size * (num_views - 1), -1))
+                # pred_cameras = gt_poses.view(batch_size * (num_views - 1), -1)
+                # poses_pred = pred_cameras
+                pred_rel_pose = refined_poses
 
-            R_kaolin = pred_absolute_pose[:, :3, :3]
-            T_kaolin = pred_absolute_pose[:, 3, :3]
-            R_opencv, T_opencv = geo_utils.kaolin2opencv(R_kaolin, T_kaolin)
-            RT_opencv = torch.cat([R_opencv, T_opencv.unsqueeze(-1)], dim=-1)
-            vertices = self.vertices_init[None].to(delta_vertices.device) + delta_vertices.repeat_interleave(num_views, dim=0)
-            focal_length = data["focal_length"]
-            k = torch.zeros([batch_size, num_views, 3, 3]).to(device)
-            k[:, :, 0, 0] = focal_length[:, :, 0] * min(W, H) // 2
-            k[:, :, 1, 1] = focal_length[:, :, 1] * min(W, H) // 2
-            k[:, :, 0, 2] = W // 2
-            k[:, :, 1, 2] = H // 2
-            k[:, :, 2, 2] = 1
-            k = k.view(-1, 3, 3)
+                canonical = data["absolute_poses"][0][:1]
+                pred_absolute_pose = geo_utils.transform_relative_pose(canonical, pred_rel_pose).view(batch_size, num_views - 1, 4, 4)
+                pred_absolute_pose = torch.cat([canonical[None].expand(batch_size, -1, -1, -1), pred_absolute_pose], dim=1)
+                pred_absolute_pose = pred_absolute_pose.view(batch_size * num_views, 4, 4)
 
-            projected_pts, dpt = geo_utils.project_points_torch(
-                vertices + center.repeat_interleave(num_views, dim=0).unsqueeze(1), 
-                RT_opencv, 
-                k
-            )    
-            normalized_pts = projected_pts.clone().detach()        
-            normalized_pts[:, :, 0] = normalized_pts[:, :, 0] / W * 2 - 1
-            normalized_pts[:, :, 1] = normalized_pts[:, :, 1] / H * 2 - 1
+                R_kaolin = pred_absolute_pose[:, :3, :3]
+                T_kaolin = pred_absolute_pose[:, 3, :3]
+                R_opencv, T_opencv = geo_utils.kaolin2opencv(R_kaolin, T_kaolin)
+                RT_opencv = torch.cat([R_opencv, T_opencv.unsqueeze(-1)], dim=-1)
+                vertices = self.vertices_init[None].to(delta_vertices.device) + delta_vertices.repeat_interleave(num_views, dim=0)
+                focal_length = data["focal_length"]
+                k = torch.zeros([batch_size, num_views, 3, 3]).to(device)
+                k[:, :, 0, 0] = focal_length[:, :, 0] * min(W, H) // 2
+                k[:, :, 1, 1] = focal_length[:, :, 1] * min(W, H) // 2
+                k[:, :, 0, 2] = W // 2
+                k[:, :, 1, 2] = H // 2
+                k[:, :, 2, 2] = 1
+                k = k.view(-1, 3, 3)
 
-            feat_tensor = output_back[0].tensors
-            pc_feat = F.grid_sample(feat_tensor, normalized_pts.unsqueeze(-2)).squeeze()
-            rgb_feat = F.grid_sample(img.view(batch_size * num_views, C, H, W), normalized_pts.unsqueeze(-2)).squeeze()
+                projected_pts, dpt = geo_utils.project_points_torch(
+                    vertices + center.repeat_interleave(num_views, dim=0).unsqueeze(1), 
+                    RT_opencv, 
+                    k
+                )    
+                normalized_pts = projected_pts.clone().detach()        
+                normalized_pts[:, :, 0] = normalized_pts[:, :, 0] / W * 2 - 1
+                normalized_pts[:, :, 1] = normalized_pts[:, :, 1] / H * 2 - 1
 
-            absolute_pose = data["absolute_poses"].view(batch_size * num_views, 4, 4)
+                feat_tensor = output_back[0].tensors
+                pc_feat = F.grid_sample(feat_tensor, normalized_pts.unsqueeze(-2)).squeeze()
+                rgb_feat = F.grid_sample(img.view(batch_size * num_views, C, H, W), normalized_pts.unsqueeze(-2)).squeeze()
 
-            refined_cameras = self.pose_refiner(pc_feat.transpose(1, 2), vertices.detach(), torch.cat([canonical_quat, poses_pred.view(batch_size, num_views - 1, -1)], dim=1).view(batch_size * num_views, -1).detach())
+                absolute_pose = data["absolute_poses"].view(batch_size * num_views, 4, 4)
+
+                refined_cameras = self.pose_refiner(pc_feat.transpose(1, 2), vertices.detach(), torch.cat([canonical_quat, poses_pred.view(batch_size, num_views - 1, -1)], dim=1).view(batch_size * num_views, -1))
+                refined_poses = refined_cameras
+                refined_cameras_dict[f"refined_cameras_{refine_iter}"] = refined_cameras
         else:
             refined_cameras = None
 
@@ -1311,7 +1323,7 @@ class MultiViewMeshFormer(nn.Module):
             "textures": textures, 
             "pred_cameras": pred_cameras, 
             "shape_memory": shape_memory.view(num_views, 8, 8, batch_size, dim).permute(3, 0, 4, 1, 2)[:, :, :256, :, :],
-            "refined_cameras": refined_cameras,
+            "refined_cameras_dict": refined_cameras_dict,
         }
 
 
