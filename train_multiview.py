@@ -4,6 +4,7 @@ import csv
 import os
 import random
 import math
+from socket import gethostname
 import tqdm
 import shutil
 import imageio
@@ -803,7 +804,10 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         refined_rot_error_dict, refined_trans_error_dict = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
         rot_all = defaultdict(list)
         canonical = torch.FloatTensor([1, 0, 0, 0, 0, 0, 0]).cuda()
-        refined_poses_pred_dict = {k: geo_utils.mat2quat(v) for k, v in refined_poses_pred_dict.items()}
+
+        # Convert to quaternion
+        if opt.refine_pose:
+            refined_poses_pred_dict = {k: geo_utils.mat2quat(v) for k, v in refined_poses_pred_dict.items()}
         for img_idx in range(len(cam_quat_gt)):
             b_id = img_idx // (num_views - 1)
             cat = category[b_id]
@@ -860,9 +864,10 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
         loss_refined_pose_all.append(loss_refined_pose.item())
         loss_refined_trans_all.append(loss_refined_trans.item())
 
-        for k in loss_refined_pose_dict.keys():
-            loss_refined_pose_dict_all[k].append(loss_refined_pose_dict[k].item())
-            loss_refined_trans_dict_all[k].append(loss_refined_trans_dict[k].item())
+        if opt.refine_pose:
+            for k in loss_refined_pose_dict.keys():
+                loss_refined_pose_dict_all[k].append(loss_refined_pose_dict[k].item())
+                loss_refined_trans_dict_all[k].append(loss_refined_trans_dict[k].item())
 
         for k in rot_all.keys():
             rot_error_all[k].append(rot_error[k])
@@ -1279,25 +1284,25 @@ def train_main(rank, size):
             schedulerE.step()
 
 
-def init_process(rank, size, fn, backend='nccl'):
+def init_process(rank, local_rank, size, fn, backend='nccl'):
     """ Initialize the distributed environment. """
-    torch.cuda.set_device(rank)
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29501'
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(backend, rank=rank, world_size=size)
+    if rank == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
     fn(rank, size)
 
 if __name__ == '__main__':
     if opt.ddp:
-        size = opt.n_gpu_per_node
-        processes = []
+        rank          = int(os.environ["SLURM_PROCID"])
+        world_size    = int(os.environ["WORLD_SIZE"])
+        gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
+        assert gpus_per_node == torch.cuda.device_count()
+        print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
+            f" {gpus_per_node} allocated GPUs per node.", flush=True)
         mp.set_start_method("spawn")
-        for rank in range(size):
-            p = mp.Process(target=init_process, args=(rank, size, train_main))
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
+        local_rank = rank - gpus_per_node * (rank // gpus_per_node)
+        p = mp.Process(target=init_process, args=(rank, local_rank, world_size, train_main))
+        p.start()
+        p.join()
     else:
         train_main(0, 1)

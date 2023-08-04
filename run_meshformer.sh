@@ -19,11 +19,13 @@
 
 #SBATCH --nodes=1
 
+#SBATCH --ntasks-per-node=8      # total number of tasks per node
+
 #SBATCH --mem=120G
 
 #SBATCH --gres=gpu:8
 
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=4
 
 #SBATCH --time=23:59:00
 
@@ -38,6 +40,14 @@
 #SBATCH --comment="SMR"
 
 #SBATCH --requeue
+
+export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+echo "WORLD_SIZE="$WORLD_SIZE
+
+master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_ADDR=$master_addr
+echo "MASTER_ADDR="$MASTER_ADDR
 
 source /private/home/haotang/.bashrc
 # module load anaconda3

@@ -1283,7 +1283,7 @@ class MultiViewMeshFormer(nn.Module):
                 refined_poses = refined_cameras
                 refined_cameras_dict[f"refined_cameras_{refine_iter}"] = refined_cameras
         else:
-            refined_cameras = None
+            refined_cameras_dict = None
 
             # # Debug and visualize
             # import matplotlib.pyplot as plt
