@@ -240,9 +240,10 @@ class PoseDecoder(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(256, 7)
         ])
+        self.lstm = nn.LSTM(feat_dim_out, feat_dim_out, 1)
 
 
-    def forward(self, pc_feat, pointcloud, coarse_pose):
+    def forward(self, pc_feat, hc, pointcloud, coarse_pose):
         num_views = self.num_views
         b_views, num_points, _ = pointcloud.shape
         batch_size = b_views // num_views
@@ -257,7 +258,11 @@ class PoseDecoder(nn.Module):
             feat = self_attn_blk(x)
 
         feat = rearrange(feat, 'b (t n) c -> b t n c', t=num_views) 
-        feat = rearrange(feat, 'b t n c -> (b t) (c n)', t=num_views) 
+        feat = rearrange(feat, 'b t n c -> (b t n) c')
+        feat, hc = self.lstm(feat.unsqueeze(0), hc)
+        feat = feat.squeeze()
+        feat = rearrange(feat, '(b t n) c -> (b t) (n c)', b=batch_size, t=num_views)
+
         refine_pose = self.out(feat)
 
         # normalize refine pose, make sure its a rotation quaternion
@@ -278,7 +283,7 @@ class PoseDecoder(nn.Module):
         pose = pose[:, 1:, :, :].contiguous()
         pose = pose.view(batch_size * (num_views - 1), 4, 4)
 
-        return pose
+        return pose, hc
 
 
 class Attention(nn.Module):
@@ -1126,7 +1131,8 @@ class MultiViewMeshFormer(nn.Module):
         return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
 
     def forward(self, x, data, use_gt_pose=False):
-        self.eval()
+        # self.eval()
+        # self.pose_refiner.lstm.train()
         device = x.device
         gt_poses = data["gt_poses"]
         center = data["center"]
@@ -1238,6 +1244,9 @@ class MultiViewMeshFormer(nn.Module):
         
         if self.refine_pose:
             refined_poses = geo_utils.quat2mat(poses_pred).detach()
+            h = torch.zeros(1, batch_size * num_views * self.num_vertices, 32).to(feat.device)
+            c = torch.zeros_like(h)
+            hc = (h, c)
             refined_cameras_dict = {}
             for refine_iter in range(self.num_refine):
                 # pred_rel_pose = geo_utils.quat2mat(gt_poses.view(batch_size * (num_views - 1), -1))
@@ -1279,7 +1288,7 @@ class MultiViewMeshFormer(nn.Module):
 
                 absolute_pose = data["absolute_poses"].view(batch_size * num_views, 4, 4)
 
-                refined_cameras = self.pose_refiner(pc_feat.transpose(1, 2), vertices.detach(), torch.cat([canonical_quat, poses_pred.view(batch_size, num_views - 1, -1)], dim=1).view(batch_size * num_views, -1))
+                refined_cameras, hc = self.pose_refiner(pc_feat.transpose(1, 2), hc, vertices.detach(), torch.cat([canonical_quat, poses_pred.view(batch_size, num_views - 1, -1)], dim=1).view(batch_size * num_views, -1))
                 refined_poses = refined_cameras
                 refined_cameras_dict[f"refined_cameras_{refine_iter}"] = refined_cameras
         else:
