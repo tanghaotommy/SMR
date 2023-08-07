@@ -555,7 +555,7 @@ class MeshFormerEncoder(nn.Module):
         self.num_refine = num_refine
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
-        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer)
+        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer, num_refine=num_refine)
         if self.use_multi_view_texture:
             self.texture_enc = MultiViewTextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
         else:
@@ -597,18 +597,12 @@ class MeshFormerEncoder(nn.Module):
         # lights
         lights = self.light_enc(input_img.view(batch_size * num_views, C, H, W))
 
-        # image feat
-        with torch.no_grad():
-            self.feat_enc.eval()
-            img_feats = self.feat_enc(input_img.view(batch_size * num_views, C, H, W))
-
         # others
         attributes = {
             'vertices': vertices,
             'delta_vertices': delta_vertices,
             'textures': textures,
             'lights': lights,
-            'img_feats': img_feats,
             'pred_cameras': pred_cameras,
             'refined_cameras_dict': refined_cameras_dict
         }
