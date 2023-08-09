@@ -69,7 +69,7 @@ srun  python train_multiview.py --batchSize 32 \
                     --dataset co3d_seq \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --outf ./log/MultiViewFormer/normalized_co3d_30cat_adam_ddp_lr0001_fixed_modelbug_bs32_try4 \
+                    --outf ./log/MeshPoseFormer/normalized_co3d_30cat_initial \
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \

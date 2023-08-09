@@ -25,7 +25,7 @@
 
 #SBATCH --gres=gpu:8
 
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=4
 
 #SBATCH --time=23:59:00
 
@@ -69,8 +69,8 @@ srun  python train_multiview.py --batchSize 12 \
                     --dataset co3d_seq \
                     --dataroot $DATA_ROOT \
                     --template_path ./template/sphere.obj \
-                    --pretrained_path ./log/MeshPoseFormer/pretrained_30cat_512  \
-                    --outf ./log/MeshPoseFormer/30cat_from_pretrained_512_3_iter_refine \
+                    --pretrained_path ./log/MeshPoseFormer/pretrained_bs32  \
+                    --outf ./log/MeshPoseFormer/bicycle_3_iter_refine_memory \
                     --azi_scope 360 \
                     --elev_range '0~30' \
                     --dist_range '2~6' \

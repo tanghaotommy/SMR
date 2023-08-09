@@ -219,11 +219,12 @@ def get_embedder(multires, i=0, input_dims=3):
 
 
 class PoseDecoder(nn.Module):
-    def __init__(self, feat_dim_in, feat_dim_out, num_points, pose_dim, num_views=5):
+    def __init__(self, feat_dim_in, feat_dim_out, num_points, pose_dim, num_views=5, refine_memory=False):
         super(PoseDecoder, self).__init__()
 
         self.self_attn_layers = 3
         self.num_views = num_views
+        self.refine_memory = refine_memory
 
         self.self_attn_blks = nn.ModuleList([
             # SelfAttention(num_heads=4, num_channels=num_points * feat_dim_out, num_qk_channels=256, num_v_channels=256, num_output_channels=256, mlp_ratio=2)
@@ -240,7 +241,11 @@ class PoseDecoder(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(256, 7)
         ])
-        self.lstm = nn.LSTM(feat_dim_out, feat_dim_out, 1)
+        # self.lstm = nn.LSTM(feat_dim_out, feat_dim_out, 1)
+
+        if refine_memory:
+            self.memory_embed = nn.Embedding(num_points, 32)
+            self.cross_attn = CrossAttention(num_heads=4, num_q_input_channels=32, num_kv_input_channels=32,mlp_ratio=4)
 
 
     def forward(self, pc_feat, hc, pointcloud, coarse_pose):
@@ -257,11 +262,17 @@ class PoseDecoder(nn.Module):
         for self_attn_blk in self.self_attn_blks:
             feat = self_attn_blk(x)
 
-        feat = rearrange(feat, 'b (t n) c -> b t n c', t=num_views) 
-        feat = rearrange(feat, 'b t n c -> (b t n) c')
-        feat, hc = self.lstm(feat.unsqueeze(0), hc)
-        feat = feat.squeeze()
-        feat = rearrange(feat, '(b t n) c -> (b t) (n c)', b=batch_size, t=num_views)
+        feat = rearrange(feat, 'b (t n) c -> (b t) n c', t=num_views)
+
+        if self.refine_memory:
+            if hc is None:
+                hc = self.memory_embed.weight.unsqueeze(0)
+                hc = hc.expand(feat.shape[0], -1, -1)
+            hc = self.cross_attn(x_q=feat, x_k=hc, x_v=hc, residual=feat)
+            # hc = self.cross_attn(x_q=hc, x_k=feat, x_v=feat, residual=hc)
+            feat = hc
+            
+        feat = rearrange(feat, '(b t) n c -> (b t) (n c)', b=batch_size, t=num_views)
 
         refine_pose = self.out(feat)
 
@@ -941,7 +952,7 @@ class MeshFormer(nn.Module):
 class MultiViewMeshFormer(nn.Module):
     """This is the base class for Transformer based mesh reconstruction"""
 
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False, norm_layer=None, num_refine=3):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, load_pretrained=False, refine_pose=False, norm_layer=None, num_refine=3, refine_memory=False):
         """Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -1069,7 +1080,7 @@ class MultiViewMeshFormer(nn.Module):
         self.camera_decoder = CameraDecoder(d_model, decoder, azi_scope, elev_range, dist_range)
 
         if self.refine_pose:
-            self.pose_refiner = PoseDecoder(d_model, 32, num_vertices, self.pose_embed_size, num_views=5)
+            self.pose_refiner = PoseDecoder(d_model, 32, num_vertices, self.pose_embed_size, num_views=5, refine_memory=refine_memory)
 
         # light decoder
         decoder_layer = TransformerDecoderLayer(
@@ -1131,7 +1142,7 @@ class MultiViewMeshFormer(nn.Module):
         return {"feat": feat_vec, "mask": mask_vec, "pos": pos_embed_vec}
 
     def forward(self, x, data, use_gt_pose=False):
-        # self.eval()
+        self.eval()
         # self.pose_refiner.lstm.train()
         device = x.device
         gt_poses = data["gt_poses"]
@@ -1244,9 +1255,10 @@ class MultiViewMeshFormer(nn.Module):
         
         if self.refine_pose:
             refined_poses = geo_utils.quat2mat(poses_pred).detach()
-            h = torch.zeros(1, batch_size * num_views * self.num_vertices, 32).to(feat.device)
-            c = torch.zeros_like(h)
-            hc = (h, c)
+            # h = torch.zeros(1, batch_size * num_views * self.num_vertices, 32).to(feat.device)
+            # c = torch.zeros_like(h)
+            # hc = (h, c)
+            hc = None
             refined_cameras_dict = {}
             for refine_iter in range(self.num_refine):
                 # pred_rel_pose = geo_utils.quat2mat(gt_poses.view(batch_size * (num_views - 1), -1))

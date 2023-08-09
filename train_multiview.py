@@ -87,6 +87,7 @@ parser.add_argument('--visualization_epoch', type=int, default=1)
 parser.add_argument('--val_epoch', type=int, default=10)
 parser.add_argument('--ddp', action='store_true', default=False, help='whether use distributedparallel')
 parser.add_argument('--refine_pose', action='store_true', default=False, help='whether refine initial pose')
+parser.add_argument('--refine_memory', action='store_true', default=False, help='whether refine using memory')
 parser.add_argument('--num_refine', type=int, default=3, help='number of pose refinement iterations')
 parser.add_argument('--eval_only', action='store_true', default=False, help='whether run only evaluation')
 parser.add_argument('--norm_layer', default=None, help='which normalization to use')
@@ -546,16 +547,17 @@ class AttributeEncoder(nn.Module):
 
 
 class MeshFormerEncoder(nn.Module):
-    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False, norm_layer=None, num_refine=opt.num_refine):
+    def __init__(self, num_vertices, vertices_init, azi_scope, elev_range, dist_range, nc, nf, nk, use_multi_view_texture=False, refine_pose=False, norm_layer=None, num_refine=opt.num_refine, refine_memory=opt.refine_memory):
         super(MeshFormerEncoder, self).__init__()
         self.num_vertices = num_vertices
         self.vertices_init = vertices_init
         self.use_multi_view_texture = use_multi_view_texture
         self.refine_pose = refine_pose
         self.num_refine = num_refine
+        self.refine_memory = refine_memory
 
         self.camera_enc = CameraEncoder(nc=nc, nk=nk, azi_scope=azi_scope, elev_range=elev_range, dist_range=dist_range)
-        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer, num_refine=num_refine)
+        self.meshformer = MultiViewMeshFormer(num_vertices, vertices_init, azi_scope, elev_range, dist_range, refine_pose=refine_pose, norm_layer=norm_layer, num_refine=num_refine, refine_memory=refine_memory)
         if self.use_multi_view_texture:
             self.texture_enc = MultiViewTextureEncoder(nc=nc, nk=nk, nf=nf, num_vertices=self.num_vertices)
         else:
@@ -776,10 +778,11 @@ def forward_pass(epoch, rank, model, optimizer, scheduler, diffRender, dataloade
                 loss_refined_pose_dict[refine_iter] = loss_refined_pose_iter
                 loss_refined_trans_dict[refine_iter] = loss_refined_trans_iter
 
-            loss_refine_iter_name = f"refined_cameras_{opt.num_refine - 1}"
+            # loss_refine_iter_name = f"refined_cameras_{opt.num_refine - 1}"
+            loss_refine_iter_name = "all"
             if loss_refine_iter_name == "all":
-                loss_refined_pose = torch.sum([v for _, v in loss_refined_pose_dict.items()])
-                loss_refined_trans = torch.sum([v for _, v in loss_refined_trans_dict.items()])
+                loss_refined_pose = torch.stack([v for _, v in loss_refined_pose_dict.items()]).sum()
+                loss_refined_trans = torch.stack([v for _, v in loss_refined_trans_dict.items()]).sum()
             else:
                 loss_refined_pose = loss_refined_pose_dict[loss_refine_iter_name]
                 loss_refined_trans = loss_refined_trans_dict[loss_refine_iter_name]
